@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"net"
 	"os"
 	"os/exec"
@@ -8,7 +9,12 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/getlantern/systray"
 )
+
+//go:embed codex_lb_icon.ico
+var iconICO []byte
 
 var (
 	shell32           = syscall.NewLazyDLL("shell32.dll")
@@ -28,7 +34,6 @@ func createNamedMutex(name string) (uintptr, error) {
 	if err != nil {
 		return 0, err
 	}
-	// CreateMutexW(lpMutexAttributes, bInitialOwner, lpName)
 	ret, _, err := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(namePtr)))
 	if ret == 0 {
 		return 0, err
@@ -58,11 +63,9 @@ func openURL(url string) error {
 }
 
 func main() {
-	// Mutex name for single instance detection
 	mutexName := "Local\\CodexLBLauncherMutex"
 	mutex, err := createNamedMutex(mutexName)
 
-	// Determine the backend port (default 2455)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "2455"
@@ -70,8 +73,7 @@ func main() {
 	url := "http://127.0.0.1:" + port
 
 	if err != nil {
-		// Mutex already exists, another instance is running.
-		// Open the browser and exit.
+		// Another instance is already running — just open the browser and exit.
 		_ = openURL(url)
 		os.Exit(0)
 	}
@@ -79,7 +81,7 @@ func main() {
 		defer procCloseHandle.Call(mutex)
 	}
 
-	// Determine installer directory to locate bundled Python relative to launcher
+	// Locate the bundled Python relative to this executable.
 	execPath, err := os.Executable()
 	if err != nil {
 		execPath = "."
@@ -88,51 +90,76 @@ func main() {
 
 	pythonExe := filepath.Join(installDir, "python", "python.exe")
 	if _, err := os.Stat(pythonExe); os.IsNotExist(err) {
-		// Fallback to system python if running in a dev environment
 		pythonExe = "python"
 	}
 
-	// Prepare command to run the FastAPI app via cli module
+	// Start the Python backend headlessly.
 	cmd := exec.Command(pythonExe, "-m", "app.cli")
 	cmd.Dir = installDir
-
-	// Hide window to run headlessly without showing terminal
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow: true,
 	}
 
-	// Run process in background
 	if err := cmd.Start(); err != nil {
 		os.Exit(1)
 	}
 
-	// Ensure Python child process is killed when the launcher exits
-	defer func() {
-		_ = cmd.Process.Kill()
-	}()
-
-	// Wait for port to become ready
-	serverReady := false
-	for i := 0; i < 150; i++ { // Try for 15 seconds (150 * 100ms)
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 100*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			serverReady = true
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if serverReady {
-		_ = openURL(url)
-	}
-
-	// Monitor child process
-	done := make(chan error, 1)
+	// Monitor the Python process in the background.
+	dying := make(chan struct{})
 	go func() {
-		done <- cmd.Wait()
+		_ = cmd.Wait()
+		close(dying)
 	}()
 
-	// Keep running until child process exits or launcher is terminated
-	<-done
+	// Wait for the server to become ready, then open the dashboard.
+	go func() {
+		for i := 0; i < 150; i++ {
+			conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 100*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				_ = openURL(url)
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// Run the system tray. This call blocks until systray.Quit() is called.
+	systray.Run(
+		func() {
+			// onReady — set up tray icon and menu.
+			systray.SetIcon(iconICO)
+			systray.SetTitle("CodexLB")
+			systray.SetTooltip("CodexLB")
+
+			mOpen := systray.AddMenuItem("Open Dashboard", "Open the web dashboard")
+			systray.AddSeparator()
+			mQuit := systray.AddMenuItem("Quit", "Stop CodexLB")
+
+			// Watch for Python process death.
+			go func() {
+				select {
+				case <-dying:
+					systray.Quit()
+				}
+			}()
+
+			// Handle menu clicks.
+			go func() {
+				for {
+					select {
+					case <-mOpen.ClickedCh:
+						_ = openURL(url)
+					case <-mQuit.ClickedCh:
+						_ = cmd.Process.Kill()
+						systray.Quit()
+					}
+				}
+			}()
+		},
+		func() {
+			// onExit — clean shutdown.
+			_ = cmd.Process.Kill()
+		},
+	)
 }

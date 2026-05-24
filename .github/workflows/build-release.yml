@@ -31,47 +31,69 @@ jobs:
           import os
           import sys
 
-          # Get Soju06/codex-lb latest release
+          my_repo = os.getenv("GITHUB_REPOSITORY")
+          token = os.getenv("GITHUB_TOKEN")
+
+          # Fetch ALL upstream releases (not just /latest, to handle pre-releases properly)
           try:
               req = urllib.request.Request(
-                  "https://api.github.com/repos/Soju06/codex-lb/releases/latest",
+                  "https://api.github.com/repos/Soju06/codex-lb/releases?per_page=20",
                   headers={"User-Agent": "Mozilla/5.0"}
               )
               with urllib.request.urlopen(req) as response:
-                  latest_release = json.loads(response.read().decode())
-                  target_tag = latest_release["tag_name"]
+                  upstream_releases = json.loads(response.read().decode())
           except Exception as e:
-              print(f"Error fetching Soju06/codex-lb latest release: {e}")
+              print(f"Error fetching upstream releases: {e}")
               sys.exit(1)
 
-          print(f"Target repository latest release: {target_tag}")
+          if not upstream_releases:
+              print("No upstream releases found.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("build_needed=false\n")
+              sys.exit(0)
 
-          # Get our repo current releases
-          my_repo = os.getenv("GITHUB_REPOSITORY")
-          token = os.getenv("GITHUB_TOKEN")
+          print(f"Upstream releases found: {len(upstream_releases)}")
+          for r in upstream_releases:
+              pre = "[PRE-RELEASE]" if r.get("prerelease") else "[STABLE]"
+              print(f"  {pre} {r['tag_name']}")
+
+          # Fetch our existing release tags
           try:
               req = urllib.request.Request(
-                  f"https://api.github.com/repos/{my_repo}/releases",
+                  f"https://api.github.com/repos/{my_repo}/releases?per_page=50",
                   headers={"User-Agent": "Mozilla/5.0", "Authorization": f"token {token}"}
               )
               with urllib.request.urlopen(req) as response:
-                  releases = json.loads(response.read().decode())
-                  our_tags = [r["tag_name"] for r in releases]
+                  our_releases = json.loads(response.read().decode())
+                  our_tags = {r["tag_name"] for r in our_releases}
           except Exception as e:
               print(f"Error fetching our releases: {e}")
-              our_tags = []
+              our_tags = set()
 
-          print(f"Our repository current releases: {our_tags}")
+          print(f"Our existing tags: {sorted(our_tags)}")
 
-          if target_tag in our_tags:
-              print("Release is up-to-date. No build needed.")
+          # Find the most recent upstream release we haven't built yet.
+          # Upstream releases are returned newest-first by GitHub.
+          target_tag = None
+          target_prerelease = False
+          for rel in upstream_releases:
+              tag = rel["tag_name"]
+              if tag not in our_tags:
+                  target_tag = tag
+                  target_prerelease = bool(rel.get("prerelease"))
+                  break
+
+          if target_tag is None:
+              print("All upstream releases already built. Nothing to do.")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("build_needed=false\n")
           else:
-              print("New release detected! Building installer...")
+              label = "pre-release" if target_prerelease else "stable release"
+              print(f"New {label} detected: {target_tag}. Building installer...")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("build_needed=true\n")
                   f.write(f"tag_name={target_tag}\n")
+                  f.write(f"prerelease={str(target_prerelease).lower()}\n")
 
       - name: Clone Target Repository at Tag
         if: steps.check.outputs.build_needed == 'true'
@@ -104,6 +126,13 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install build tools (Pillow, rsrc)
+        if: steps.check.outputs.build_needed == 'true'
+        shell: bash
+        run: |
+          pip install Pillow
+          go install github.com/akavel/rsrc@latest
+
       - name: Build Frontend Assets
         if: steps.check.outputs.build_needed == 'true'
         shell: bash
@@ -124,9 +153,10 @@ jobs:
         with:
           tag_name: ${{ steps.check.outputs.tag_name }}
           name: Release ${{ steps.check.outputs.tag_name }}
+          prerelease: ${{ steps.check.outputs.prerelease }}
           body: |
             Automated Windows installer package for Codex Load Balancer version `${{ steps.check.outputs.tag_name }}`.
             
             Double-click the installer to install. Launching the program will start Codex Load Balancer silently in the background and pop up the dashboard in your default browser.
-          files: dist/CodexLB_Installer.exe
+          files: dist/CodexLB_Installer_*.exe
           token: ${{ secrets.GITHUB_TOKEN }}

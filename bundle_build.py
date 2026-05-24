@@ -4,6 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 import os
+import sys
+import re
 
 # Configuration
 PYTHON_VERSION = "3.13.5"
@@ -84,16 +86,63 @@ def install_dependencies():
     subprocess.run(cmd, check=True)
     print("Dependencies installation completed.")
 
+def embed_icon_resource():
+    """Convert PNG icon to ICO and embed as Windows resource via rsrc."""
+    icon_png = WORKSPACE_DIR / "codex_lb_icon.png"
+    icon_ico = WORKSPACE_DIR / "codex_lb_icon.ico"
+    syso_file = WORKSPACE_DIR / "rsrc.syso"
+
+    if not icon_png.exists():
+        print("Warning: codex_lb_icon.png not found, skipping icon resource.")
+        return
+
+    # Convert PNG to ICO using Pillow
+    if not icon_ico.exists() or icon_png.stat().st_mtime > icon_ico.stat().st_mtime:
+        print("Converting icon PNG to ICO...")
+        try:
+            from PIL import Image
+            img = Image.open(icon_png)
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            sizes = [(256, 256), (64, 64), (48, 48), (32, 32), (16, 16)]
+            img.save(icon_ico, format='ICO', sizes=sizes)
+            print("ICO created.")
+        except ImportError:
+            print("Warning: Pillow not available, skipping ICO conversion.")
+            return
+
+    # Generate Windows resource .syso using rsrc
+    if not syso_file.exists() or icon_ico.stat().st_mtime > syso_file.stat().st_mtime:
+        print("Embedding icon as Windows resource...")
+        subprocess.run(
+            ["rsrc", "-ico", str(icon_ico), "-o", str(syso_file)],
+            cwd=WORKSPACE_DIR, check=True
+        )
+        print("Windows resource created.")
+
+
 def copy_launcher():
     print("Compiling and copying launcher.exe...")
-    # Compile launcher.go if needed, otherwise compile it now
+    embed_icon_resource()
+    # Compile launcher.go — rsrc.syso is auto-linked when present in the package
     subprocess.run([
         "go", "build",
         "-ldflags", "-H=windowsgui",
         "-o", str(BUNDLE_DIR / "launcher.exe"),
-        "launcher.go"
     ], cwd=WORKSPACE_DIR, check=True)
     print("launcher.exe compiled and copied to bundle.")
+
+def get_app_version() -> str:
+    """Read version from codex-lb-src/pyproject.toml."""
+    pyproject = SRC_DIR / "pyproject.toml"
+    if not pyproject.exists():
+        raise FileNotFoundError(f"pyproject.toml not found at {pyproject}")
+    content = pyproject.read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+    if not match:
+        raise ValueError(f"Could not find version in {pyproject}")
+    return match.group(1)
+
 
 def compile_installer():
     print("Compiling Inno Setup installer...")
@@ -101,11 +150,41 @@ def compile_installer():
         print(f"Error: Inno Setup compiler not found at {ISCC_PATH}")
         print("Please compile installer.iss manually or ensure Inno Setup is installed.")
         return
-        
+
+    # Dynamically set AppVersion from the source pyproject.toml
+    app_version = get_app_version()
+    print(f"App version: {app_version}")
+
+    # Read installer.iss and update version fields
+    iss_path = WORKSPACE_DIR / "installer.iss"
+    iss_content = iss_path.read_text(encoding="utf-8")
+    iss_content = re.sub(
+        r'^AppVersion=.*$',
+        f'AppVersion={app_version}',
+        iss_content,
+        flags=re.MULTILINE
+    )
+    iss_content = re.sub(
+        r'^AppVerName=.*$',
+        f'AppVerName=CodexLB {app_version}',
+        iss_content,
+        flags=re.MULTILINE
+    )
+    # Also update OutputBaseFilename to include version
+    safe_version = app_version.replace("-", "_")
+    iss_content = re.sub(
+        r'^OutputBaseFilename=.*$',
+        f'OutputBaseFilename=CodexLB_Installer_{safe_version}',
+        iss_content,
+        flags=re.MULTILINE
+    )
+    iss_path.write_text(iss_content, encoding="utf-8")
+    print(f"Updated installer.iss with AppVersion={app_version}")
+
     subprocess.run([
         str(ISCC_PATH),
         "/Q", # Quiet mode
-        "installer.iss"
+        str(iss_path)
     ], cwd=WORKSPACE_DIR, check=True)
     print("Installer compiled successfully.")
 
