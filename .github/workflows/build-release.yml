@@ -1,0 +1,132 @@
+name: Build and Release Codex-LB Installer
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Run every 6 hours
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Enable manual triggers
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    name: Check for New Releases and Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Our Repository
+        uses: actions/checkout@v4
+
+      - name: Check for New Target Releases
+        id: check
+        shell: python
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          import urllib.request
+          import json
+          import os
+          import sys
+
+          # Get Soju06/codex-lb latest release
+          try:
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/Soju06/codex-lb/releases/latest",
+                  headers={"User-Agent": "Mozilla/5.0"}
+              )
+              with urllib.request.urlopen(req) as response:
+                  latest_release = json.loads(response.read().decode())
+                  target_tag = latest_release["tag_name"]
+          except Exception as e:
+              print(f"Error fetching Soju06/codex-lb latest release: {e}")
+              sys.exit(1)
+
+          print(f"Target repository latest release: {target_tag}")
+
+          # Get our repo current releases
+          my_repo = os.getenv("GITHUB_REPOSITORY")
+          token = os.getenv("GITHUB_TOKEN")
+          try:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{my_repo}/releases",
+                  headers={"User-Agent": "Mozilla/5.0", "Authorization": f"token {token}"}
+              )
+              with urllib.request.urlopen(req) as response:
+                  releases = json.loads(response.read().decode())
+                  our_tags = [r["tag_name"] for r in releases]
+          except Exception as e:
+              print(f"Error fetching our releases: {e}")
+              our_tags = []
+
+          print(f"Our repository current releases: {our_tags}")
+
+          if target_tag in our_tags:
+              print("Release is up-to-date. No build needed.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("build_needed=false\n")
+          else:
+              print("New release detected! Building installer...")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("build_needed=true\n")
+                  f.write(f"tag_name={target_tag}\n")
+
+      - name: Clone Target Repository at Tag
+        if: steps.check.outputs.build_needed == 'true'
+        shell: bash
+        run: |
+          rm -rf codex-lb-src
+          git clone --depth 1 --branch ${{ steps.check.outputs.tag_name }} https://github.com/Soju06/codex-lb.git codex-lb-src
+
+      - name: Setup Go compiler
+        if: steps.check.outputs.build_needed == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Setup Node.js
+        if: steps.check.outputs.build_needed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        if: steps.check.outputs.build_needed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup uv
+        if: steps.check.outputs.build_needed == 'true'
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build Frontend Assets
+        if: steps.check.outputs.build_needed == 'true'
+        shell: bash
+        run: |
+          cd codex-lb-src/frontend
+          npm install
+          npm run build
+
+      - name: Build and Package Installer
+        if: steps.check.outputs.build_needed == 'true'
+        shell: pwsh
+        run: |
+          python bundle_build.py
+
+      - name: Create Release and Upload Asset
+        if: steps.check.outputs.build_needed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check.outputs.tag_name }}
+          name: Release ${{ steps.check.outputs.tag_name }}
+          body: |
+            Automated Windows installer package for Codex Load Balancer version `${{ steps.check.outputs.tag_name }}`.
+            
+            Double-click the installer to install. Launching the program will start Codex Load Balancer silently in the background and pop up the dashboard in your default browser.
+          files: dist/CodexLB_Installer.exe
+          token: ${{ secrets.GITHUB_TOKEN }}

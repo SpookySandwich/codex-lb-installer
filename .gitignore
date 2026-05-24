@@ -1,0 +1,17 @@
+# Build artifacts
+dist/
+build/
+*.exe
+
+# Python temporary files
+*.zip
+*.log
+
+# Git sub-sources
+codex-lb-src/
+
+# Local configuration
+.env
+.env.local
+.venv/
+__pycache__/
