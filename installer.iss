@@ -19,16 +19,20 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 
+[Tasks]
+Name: autostart; Description: "Automatically start Codex Load Balancer when logging in"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+
 [Files]
 Source: "dist\bundle\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\CodexLB"; Filename: "{app}\launcher.exe"; IconFilename: "{app}\launcher.exe"; IconIndex: 0
-Name: "{group}\Uninstall CodexLB"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\CodexLB"; Filename: "{app}\launcher.exe"; IconFilename: "{app}\launcher.exe"; IconIndex: 0
+Name: "{group}\Codex Load Balancer"; Filename: "{app}\launcher.exe"
+Name: "{group}\Uninstall Codex Load Balancer"; Filename: "{uninstallexe}"
+Name: "{userdesktop}\Codex Load Balancer"; Filename: "{app}\launcher.exe"
+Name: "{userstartup}\Codex Load Balancer"; Filename: "{app}\launcher.exe"; Tasks: autostart
 
 [Run]
-Filename: "{app}\launcher.exe"; Description: "Launch CodexLB"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\launcher.exe"; Description: "Launch Codex Load Balancer"; Flags: nowait postinstall skipifsilent
 
 [Code]
 var
