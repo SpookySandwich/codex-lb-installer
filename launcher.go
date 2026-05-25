@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/getlantern/systray"
+	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed codex_lb_icon.ico
@@ -27,6 +28,8 @@ var (
 const (
 	ERROR_ALREADY_EXISTS = 183
 	SW_SHOWNORMAL        = 1
+	registryRunKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
+	registryValueName    = "CodexLB"
 )
 
 func createNamedMutex(name string) (uintptr, error) {
@@ -60,6 +63,40 @@ func openURL(url string) error {
 		return err
 	}
 	return nil
+}
+
+func isAutostartEnabled() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+
+	_, _, err = k.GetStringValue(registryValueName)
+	return err == nil
+}
+
+func setAutostart(enabled bool) error {
+	if enabled {
+		execPath, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.SET_VALUE)
+		if err != nil {
+			return err
+		}
+		defer k.Close()
+		// Wrap in quotes to handle paths with spaces safely
+		return k.SetStringValue(registryValueName, `"`+execPath+`"`)
+	} else {
+		k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.SET_VALUE)
+		if err != nil {
+			return err
+		}
+		defer k.Close()
+		return k.DeleteValue(registryValueName)
+	}
 }
 
 func main() {
@@ -133,6 +170,7 @@ func main() {
 			systray.SetTooltip("CodexLB")
 
 			mOpen := systray.AddMenuItem("Open Dashboard", "Open the web dashboard")
+			mAutostart := systray.AddMenuItemCheckbox("Start on Windows Logon", "Start CodexLB automatically on startup", isAutostartEnabled())
 			systray.AddSeparator()
 			mQuit := systray.AddMenuItem("Quit", "Stop CodexLB")
 
@@ -150,6 +188,14 @@ func main() {
 					select {
 					case <-mOpen.ClickedCh:
 						_ = openURL(url)
+					case <-mAutostart.ClickedCh:
+						if mAutostart.Checked() {
+							_ = setAutostart(false)
+							mAutostart.Uncheck()
+						} else {
+							_ = setAutostart(true)
+							mAutostart.Check()
+						}
 					case <-mQuit.ClickedCh:
 						_ = cmd.Process.Kill()
 						systray.Quit()
