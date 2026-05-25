@@ -126,6 +126,42 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Patch frontend for recharts type compatibility
+        if: steps.check.outputs.build_needed == 'true'
+        shell: python
+        run: |
+          """Fix recharts PieSectorDataItem type change — v3.8+ removed `id`
+          from the callback parameter; use `data.payload` instead."""
+          import pathlib
+
+          fp = pathlib.Path("codex-lb-src/frontend/src/components/donut-chart.tsx")
+          content = fp.read_text()
+
+          # The buggy pattern: onMouseEnter callback accesses data.id directly
+          # Replace with data.payload access (as done in codex-lb v1.18.2+).
+          old = (
+              "onMouseEnter={(data) => {\n"
+              "                  if (typeof data?.id === \"string\") {\n"
+              "                    setActiveLegendId(data.id);\n"
+              "                  }\n"
+              "                }}"
+          )
+          new = (
+              "onMouseEnter={(data) => {\n"
+              "                  const datum = (data?.payload as DonutDatum | undefined);\n"
+              "                  if (typeof datum?.id === \"string\") {\n"
+              "                    setActiveLegendId(datum.id);\n"
+              "                  }\n"
+              "                }}"
+          )
+
+          if old in content:
+              content = content.replace(old, new)
+              fp.write_text(content)
+              print("Patched donut-chart.tsx: data.id -> data.payload")
+          else:
+              print("donut-chart.tsx already patched or pattern not found — skipping.")
+
       - name: Install build tools (Pillow, rsrc)
         if: steps.check.outputs.build_needed == 'true'
         shell: bash
