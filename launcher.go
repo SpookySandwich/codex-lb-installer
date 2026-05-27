@@ -26,7 +26,47 @@ var (
 	kernel32          = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutexW  = kernel32.NewProc("CreateMutexW")
 	procCloseHandle   = kernel32.NewProc("CloseHandle")
+	procGetUserDefaultLCID = kernel32.NewProc("GetUserDefaultLCID")
 )
+
+// Tray menu strings - auto-detected based on system locale
+type trayStrings struct {
+	OpenDashboard string
+	StartOnLogon  string
+	AutoUpdate    string
+	CheckUpdates  string
+	Quit          string
+	Tooltip       string
+}
+
+var lang = trayStrings{
+	OpenDashboard: "Open Dashboard",
+	StartOnLogon:  "Start on Windows Logon",
+	AutoUpdate:    "Auto Update",
+	CheckUpdates:  "Check for Updates",
+	Quit:          "Quit",
+	Tooltip:       "CodexLB",
+}
+
+func isChineseLocale() bool {
+	lcid, _, _ := procGetUserDefaultLCID.Call()
+	// Chinese Simplified: 0x0804, Chinese Traditional: 0x0404
+	// LCID & 0xFF == 0x04 means Chinese
+	return (lcid&0x3FF) == 0x004
+}
+
+func init() {
+	if isChineseLocale() {
+		lang = trayStrings{
+			OpenDashboard: "\u6253\u5f00\u4eea\u8868\u76d8",
+			StartOnLogon:  "\u5f00\u673a\u81ea\u52a8\u542f\u52a8",
+			AutoUpdate:    "\u81ea\u52a8\u66f4\u65b0",
+			CheckUpdates:  "\u68c0\u67e5\u66f4\u65b0",
+			Quit:          "\u9000\u51fa",
+			Tooltip:       "CodexLB",
+		}
+	}
+}
 
 const (
 	ERROR_ALREADY_EXISTS = 183
@@ -323,14 +363,14 @@ func main() {
 			// onReady — set up tray icon and menu.
 			systray.SetIcon(iconICO)
 			systray.SetTitle("CodexLB")
-			systray.SetTooltip("CodexLB")
+			systray.SetTooltip(lang.Tooltip)
 
-			mOpen := systray.AddMenuItem("Open Dashboard", "Open the web dashboard")
-			mAutostart := systray.AddMenuItemCheckbox("Start on Windows Logon", "Start CodexLB automatically on startup", isAutostartEnabled())
-			mAutoUpdate := systray.AddMenuItemCheckbox("Auto Update", "Automatically check and install updates on startup", isAutoUpdateEnabled())
-			mUpdate := systray.AddMenuItem("Check for Updates", "Check for new stable version and install if available")
+			mOpen := systray.AddMenuItem(lang.OpenDashboard, "Open the web dashboard")
+			mAutostart := systray.AddMenuItemCheckbox(lang.StartOnLogon, "Start CodexLB automatically on startup", isAutostartEnabled())
+			mAutoUpdate := systray.AddMenuItemCheckbox(lang.AutoUpdate, "Automatically check and install updates on startup", isAutoUpdateEnabled())
+			mUpdate := systray.AddMenuItem(lang.CheckUpdates, "Check for new stable version and install if available")
 			systray.AddSeparator()
-			mQuit := systray.AddMenuItem("Quit", "Stop CodexLB")
+			mQuit := systray.AddMenuItem(lang.Quit, "Stop CodexLB")
 
 			// Watch for Python process death.
 			go func() {
