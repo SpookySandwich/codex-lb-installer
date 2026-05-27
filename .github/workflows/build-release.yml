@@ -72,28 +72,44 @@ jobs:
 
           print(f"Our existing tags: {sorted(our_tags)}")
 
-          # Find the most recent upstream release we haven't built yet.
-          # Upstream releases are returned newest-first by GitHub.
-          target_tag = None
-          target_prerelease = False
+          # Only build the LATEST stable release from upstream.
+          # Don't build all releases - just the newest stable one.
+          # Also build the latest pre-release if it's newer than the latest stable.
+          latest_stable = None
+          latest_prerelease = None
           for rel in upstream_releases:
               tag = rel["tag_name"]
-              if tag not in our_tags:
-                  target_tag = tag
-                  target_prerelease = bool(rel.get("prerelease"))
+              is_pre = bool(rel.get("prerelease"))
+              if is_pre:
+                  if latest_prerelease is None:
+                      latest_prerelease = rel
+              else:
+                  if latest_stable is None:
+                      latest_stable = rel
+              # Stop once we have both
+              if latest_stable and latest_prerelease:
                   break
 
-          if target_tag is None:
-              print("All upstream releases already built. Nothing to do.")
+          # Prefer stable over pre-release
+          target_rel = latest_stable or latest_prerelease
+          if target_rel is None:
+              print("No upstream releases found.")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("build_needed=false\n")
           else:
-              label = "pre-release" if target_prerelease else "stable release"
-              print(f"New {label} detected: {target_tag}. Building installer...")
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("build_needed=true\n")
-                  f.write(f"tag_name={target_tag}\n")
-                  f.write(f"prerelease={str(target_prerelease).lower()}\n")
+              target_tag = target_rel["tag_name"]
+              target_prerelease = bool(target_rel.get("prerelease"))
+              if target_tag in our_tags:
+                  print(f"Latest release {target_tag} already built. Nothing to do.")
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write("build_needed=false\n")
+              else:
+                  label = "pre-release" if target_prerelease else "stable release"
+                  print(f"New {label} detected: {target_tag}. Building installer...")
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write("build_needed=true\n")
+                      f.write(f"tag_name={target_tag}\n")
+                      f.write(f"prerelease={str(target_prerelease).lower()}\n")
 
       - name: Clone Target Repository at Tag
         if: steps.check.outputs.build_needed == 'true'

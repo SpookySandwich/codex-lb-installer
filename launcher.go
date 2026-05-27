@@ -218,6 +218,40 @@ type GitHubRelease struct {
 	} `json:"assets"`
 }
 
+// parseVersion extracts major, minor, patch from a version string like "v1.19.0" or "1.19.0-beta.1".
+func parseVersion(v string) (int, int, int) {
+	// Strip leading 'v'
+	if len(v) > 0 && v[0] == 'v' {
+		v = v[1:]
+	}
+	// Strip suffix like "-beta.1"
+	for i, c := range v {
+		if c == '-' {
+			v = v[:i]
+			break
+		}
+	}
+	var major, minor, patch int
+	n, _ := fmt.Sscanf(v, "%d.%d.%d", &major, &minor, &patch)
+	if n < 1 {
+		return 0, 0, 0
+	}
+	return major, minor, patch
+}
+
+// isNewerVersion returns true if version a is newer than version b.
+func isNewerVersion(a, b string) bool {
+	am, ami, ap := parseVersion(a)
+	bm, bmi, bp := parseVersion(b)
+	if am != bm {
+		return am > bm
+	}
+	if ami != bmi {
+		return ami > bmi
+	}
+	return ap > bp
+}
+
 // checkForUpdates checks GitHub for a newer stable release.
 func checkForUpdates() (string, string, error) {
 	httpClient := &http.Client{Timeout: 10 * time.Second}
@@ -236,15 +270,21 @@ func checkForUpdates() (string, string, error) {
 		return "", "", fmt.Errorf("failed to parse releases: %w", err)
 	}
 
-	// Find the latest stable release that's newer than current
+	// Find the latest stable release that's actually newer than current version
+	var bestTag string
+	var bestURL string
 	for _, rel := range releases {
 		if rel.Prerelease {
 			continue
 		}
-		if rel.TagName == currentVersion {
-			return "", "", nil // Already up to date
+		if !isNewerVersion(rel.TagName, currentVersion) {
+			continue
 		}
-		// Found a newer version
+		// This release is newer - check if it's the best we've found
+		if bestTag != "" && !isNewerVersion(rel.TagName, bestTag) {
+			continue
+		}
+		// Find installer asset
 		var installerURL string
 		for _, asset := range rel.Assets {
 			if len(asset.Name) > 4 && asset.Name[len(asset.Name)-4:] == ".exe" {
@@ -252,12 +292,15 @@ func checkForUpdates() (string, string, error) {
 				break
 			}
 		}
-		if installerURL == "" {
-			return "", "", fmt.Errorf("no installer found in release")
+		if installerURL != "" {
+			bestTag = rel.TagName
+			bestURL = installerURL
 		}
-		return rel.TagName, installerURL, nil
 	}
-	return "", "", nil // No newer release found
+	if bestTag == "" {
+		return "", "", nil // Already up to date
+	}
+	return bestTag, bestURL, nil
 }
 
 // downloadAndInstall downloads the installer and launches it silently.
