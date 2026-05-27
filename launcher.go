@@ -23,6 +23,8 @@ var iconICO []byte
 var (
 	shell32           = syscall.NewLazyDLL("shell32.dll")
 	procShellExecuteW = shell32.NewProc("ShellExecuteW")
+	user32            = syscall.NewLazyDLL("user32.dll")
+	procMessageBoxW   = user32.NewProc("MessageBoxW")
 	kernel32          = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutexW  = kernel32.NewProc("CreateMutexW")
 	procCloseHandle   = kernel32.NewProc("CloseHandle")
@@ -31,21 +33,52 @@ var (
 
 // Tray menu strings - auto-detected based on system locale
 type trayStrings struct {
-	OpenDashboard string
-	StartOnLogon  string
-	AutoUpdate    string
-	CheckUpdates  string
-	Quit          string
-	Tooltip       string
+	OpenDashboard    string
+	StartOnLogon     string
+	AutoUpdate       string
+	CheckUpdates     string
+	Quit             string
+	Tooltip          string
+	UpdateAvailable  string
+	UpToDate         string
+	InstallConfirm   string
+	DownloadFailed   string
+	CheckFailed      string
 }
 
 var lang = trayStrings{
-	OpenDashboard: "Open Dashboard",
-	StartOnLogon:  "Start on Windows Logon",
-	AutoUpdate:    "Auto Update",
-	CheckUpdates:  "Check for Updates",
-	Quit:          "Quit",
-	Tooltip:       "CodexLB",
+	OpenDashboard:   "Open Dashboard",
+	StartOnLogon:    "Start on Windows Logon",
+	AutoUpdate:      "Auto Update",
+	CheckUpdates:    "Check for Updates",
+	Quit:            "Quit",
+	Tooltip:         "CodexLB",
+	UpdateAvailable: "Update Available",
+	UpToDate:        "CodexLB is up to date.",
+	InstallConfirm:  "New version %s found.\nInstall now?",
+	DownloadFailed:  "Failed to download update.",
+	CheckFailed:     "Failed to check for updates.",
+}
+
+const (
+	MB_OK           = 0x00000000
+	MB_YESNO        = 0x00000004
+	MB_ICONINFO     = 0x00000040
+	MB_ICONQUESTION = 0x00000020
+	MB_ICONERROR    = 0x00000010
+	IDYES           = 6
+)
+
+func showMessageBox(title, message string, flags uint32) int {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	messagePtr, _ := syscall.UTF16PtrFromString(message)
+	ret, _, _ := procMessageBoxW.Call(
+		0,
+		uintptr(unsafe.Pointer(messagePtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+	return int(ret)
 }
 
 func isChineseLocale() bool {
@@ -58,12 +91,17 @@ func isChineseLocale() bool {
 func init() {
 	if isChineseLocale() {
 		lang = trayStrings{
-			OpenDashboard: "\u6253\u5f00\u4eea\u8868\u76d8",
-			StartOnLogon:  "\u5f00\u673a\u81ea\u52a8\u542f\u52a8",
-			AutoUpdate:    "\u81ea\u52a8\u66f4\u65b0",
-			CheckUpdates:  "\u68c0\u67e5\u66f4\u65b0",
-			Quit:          "\u9000\u51fa",
-			Tooltip:       "CodexLB",
+			OpenDashboard:   "\u6253\u5f00\u4eea\u8868\u76d8",
+			StartOnLogon:    "\u5f00\u673a\u81ea\u52a8\u542f\u52a8",
+			AutoUpdate:      "\u81ea\u52a8\u66f4\u65b0",
+			CheckUpdates:    "\u68c0\u67e5\u66f4\u65b0",
+			Quit:            "\u9000\u51fa",
+			Tooltip:         "CodexLB",
+			UpdateAvailable: "\u53d1\u73b0\u65b0\u7248\u672c",
+			UpToDate:        "CodexLB \u5df2\u662f\u6700\u65b0\u7248\u672c\u3002",
+			InstallConfirm:  "\u53d1\u73b0\u65b0\u7248\u672c %s\uff0c\u662f\u5426\u7acb\u5373\u5b89\u88c5\uff1f",
+			DownloadFailed:  "\u4e0b\u8f7d\u66f4\u65b0\u5931\u8d25\u3002",
+			CheckFailed:     "\u68c0\u67e5\u66f4\u65b0\u5931\u8d25\u3002",
 		}
 	}
 }
@@ -275,6 +313,40 @@ WshShell.Run "\"%s\"" & " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART", 0, True`,
 	return vbs.Start()
 }
 
+// downloadAndInstallVisible downloads the installer and runs it with the window visible.
+// Used when the user manually clicks "Check for Updates" and confirms installation.
+func downloadAndInstallVisible(url string) error {
+	tmpDir := os.TempDir()
+	installerPath := filepath.Join(tmpDir, "CodexLB_Installer_Update.exe")
+
+	// Download the installer
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
+	}
+
+	file, err := os.Create(installerPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := file.ReadFrom(resp.Body); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	file.Close()
+
+	// Launch the installer with window visible (no /VERYSILENT).
+	installer := exec.Command(installerPath, "/NORESTART")
+	return installer.Start()
+}
+
 func main() {
 	mutexName := "Local\\CodexLBLauncherMutex"
 	mutex, err := createNamedMutex(mutexName)
@@ -346,10 +418,17 @@ func main() {
 			if err != nil || newTag == "" {
 				return
 			}
+			// Ask user to confirm installation
+			msg := fmt.Sprintf(lang.InstallConfirm, newTag)
+			ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
+			if ret != IDYES {
+				return
+			}
 			// Kill Python backend first to release file locks
 			_ = cmd.Process.Kill()
 			time.Sleep(2 * time.Second)
-			if err := downloadAndInstall(installerURL); err != nil {
+			if err := downloadAndInstallVisible(installerURL); err != nil {
+				showMessageBox("CodexLB", lang.DownloadFailed, MB_OK|MB_ICONERROR)
 				return
 			}
 			// Exit so installer can replace locked files
@@ -390,15 +469,24 @@ func main() {
 						go func() {
 							newTag, installerURL, err := checkForUpdates()
 							if err != nil {
+								showMessageBox("CodexLB", lang.CheckFailed, MB_OK|MB_ICONERROR)
 								return
 							}
 							if newTag == "" {
-								return // Already up to date
+								showMessageBox("CodexLB", lang.UpToDate, MB_OK|MB_ICONINFO)
+								return
+							}
+							// Ask user to confirm installation
+							msg := fmt.Sprintf(lang.InstallConfirm, newTag)
+							ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
+							if ret != IDYES {
+								return
 							}
 							// Kill Python backend first to release file locks
 							_ = cmd.Process.Kill()
 							time.Sleep(2 * time.Second)
-							if err := downloadAndInstall(installerURL); err != nil {
+							if err := downloadAndInstallVisible(installerURL); err != nil {
+								showMessageBox("CodexLB", lang.DownloadFailed, MB_OK|MB_ICONERROR)
 								return
 							}
 							// Exit so installer can replace locked files
