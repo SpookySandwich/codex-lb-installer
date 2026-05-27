@@ -2,7 +2,10 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
+	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +33,11 @@ const (
 	SW_SHOWNORMAL        = 1
 	registryRunKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
 	registryValueName    = "CodexLB"
+	githubAPIURL         = "https://api.github.com/repos/SpookySandwich/codex-lb-installer/releases"
 )
+
+// currentVersion is set via ldflags at build time.
+var currentVersion string
 
 func createNamedMutex(name string) (uintptr, error) {
 	namePtr, err := syscall.UTF16PtrFromString(name)
@@ -97,6 +104,95 @@ func setAutostart(enabled bool) error {
 		defer k.Close()
 		return k.DeleteValue(registryValueName)
 	}
+}
+
+// GitHubRelease represents the GitHub API response for a release.
+type GitHubRelease struct {
+	TagName    string `json:"tag_name"`
+	Prerelease bool   `json:"prerelease"`
+	Assets     []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+// checkForUpdates checks GitHub for a newer stable release.
+func checkForUpdates() (string, string, error) {
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Get(githubAPIURL)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to check for updates: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var releases []GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return "", "", fmt.Errorf("failed to parse releases: %w", err)
+	}
+
+	// Find the latest stable release that's newer than current
+	for _, rel := range releases {
+		if rel.Prerelease {
+			continue
+		}
+		if rel.TagName == currentVersion {
+			return "", "", nil // Already up to date
+		}
+		// Found a newer version
+		var installerURL string
+		for _, asset := range rel.Assets {
+			if len(asset.Name) > 4 && asset.Name[len(asset.Name)-4:] == ".exe" {
+				installerURL = asset.BrowserDownloadURL
+				break
+			}
+		}
+		if installerURL == "" {
+			return "", "", fmt.Errorf("no installer found in release")
+		}
+		return rel.TagName, installerURL, nil
+	}
+	return "", "", nil // No newer release found
+}
+
+// downloadAndInstall downloads the installer and launches it silently.
+// The caller should exit the process after this returns so the installer
+// can replace the locked launcher.exe file.
+func downloadAndInstall(url string) error {
+	tmpDir := os.TempDir()
+	installerPath := filepath.Join(tmpDir, "CodexLB_Installer_Update.exe")
+
+	// Download the installer
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
+	}
+
+	file, err := os.Create(installerPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := file.ReadFrom(resp.Body); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	file.Close()
+
+	// Launch the installer silently then return.
+	// The caller must exit the process so the installer can replace locked files.
+	installer := exec.Command(installerPath, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
+	installer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return installer.Start()
 }
 
 func main() {
@@ -171,6 +267,7 @@ func main() {
 
 			mOpen := systray.AddMenuItem("Open Dashboard", "Open the web dashboard")
 			mAutostart := systray.AddMenuItemCheckbox("Start on Windows Logon", "Start CodexLB automatically on startup", isAutostartEnabled())
+			mUpdate := systray.AddMenuItem("Check for Updates", "Check for new stable version and install if available")
 			systray.AddSeparator()
 			mQuit := systray.AddMenuItem("Quit", "Stop CodexLB")
 
@@ -188,6 +285,22 @@ func main() {
 					select {
 					case <-mOpen.ClickedCh:
 						_ = openURL(url)
+					case <-mUpdate.ClickedCh:
+						go func() {
+							newTag, installerURL, err := checkForUpdates()
+							if err != nil {
+								return
+							}
+							if newTag == "" {
+								return // Already up to date
+							}
+							if err := downloadAndInstall(installerURL); err != nil {
+								return
+							}
+							// Kill Python backend, then exit so installer can replace locked files
+							_ = cmd.Process.Kill()
+							os.Exit(0)
+						}()
 					case <-mAutostart.ClickedCh:
 						if mAutostart.Checked() {
 							_ = setAutostart(false)

@@ -124,10 +124,11 @@ def embed_icon_resource():
 def copy_launcher():
     print("Compiling and copying launcher.exe...")
     embed_icon_resource()
+    app_version = get_app_version()
     # Compile launcher.go — rsrc.syso is auto-linked when present in the package
     subprocess.run([
         "go", "build",
-        "-ldflags", "-H=windowsgui",
+        "-ldflags", f"-H=windowsgui -X main.currentVersion={app_version}",
         "-o", str(BUNDLE_DIR / "launcher.exe"),
     ], cwd=WORKSPACE_DIR, check=True)
     print("launcher.exe compiled and copied to bundle.")
