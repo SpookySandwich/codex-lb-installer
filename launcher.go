@@ -33,6 +33,7 @@ const (
 	SW_SHOWNORMAL        = 1
 	registryRunKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
 	registryValueName    = "CodexLB"
+	registryAutoUpdate   = "CodexLBAutoUpdate"
 	githubAPIURL         = "https://api.github.com/repos/SpookySandwich/codex-lb-installer/releases"
 )
 
@@ -81,6 +82,29 @@ func isAutostartEnabled() bool {
 
 	_, _, err = k.GetStringValue(registryValueName)
 	return err == nil
+}
+
+func isAutoUpdateEnabled() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+
+	val, _, err := k.GetIntegerValue(registryAutoUpdate)
+	return err == nil && val == 1
+}
+
+func setAutoUpdate(enabled bool) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if enabled {
+		return k.SetDWordValue(registryAutoUpdate, 1)
+	}
+	return k.DeleteValue(registryAutoUpdate)
 }
 
 func setAutostart(enabled bool) error {
@@ -257,6 +281,24 @@ func main() {
 		}
 	}()
 
+	// Auto-update check on startup if enabled.
+	if isAutoUpdateEnabled() {
+		go func() {
+			// Wait a moment for the app to fully start
+			time.Sleep(10 * time.Second)
+			newTag, installerURL, err := checkForUpdates()
+			if err != nil || newTag == "" {
+				return
+			}
+			if err := downloadAndInstall(installerURL); err != nil {
+				return
+			}
+			// Kill Python backend, then exit so installer can replace locked files
+			_ = cmd.Process.Kill()
+			os.Exit(0)
+		}()
+	}
+
 	// Run the system tray. This call blocks until systray.Quit() is called.
 	systray.Run(
 		func() {
@@ -267,6 +309,7 @@ func main() {
 
 			mOpen := systray.AddMenuItem("Open Dashboard", "Open the web dashboard")
 			mAutostart := systray.AddMenuItemCheckbox("Start on Windows Logon", "Start CodexLB automatically on startup", isAutostartEnabled())
+			mAutoUpdate := systray.AddMenuItemCheckbox("Auto Update", "Automatically check and install updates on startup", isAutoUpdateEnabled())
 			mUpdate := systray.AddMenuItem("Check for Updates", "Check for new stable version and install if available")
 			systray.AddSeparator()
 			mQuit := systray.AddMenuItem("Quit", "Stop CodexLB")
@@ -308,6 +351,14 @@ func main() {
 						} else {
 							_ = setAutostart(true)
 							mAutostart.Check()
+						}
+					case <-mAutoUpdate.ClickedCh:
+						if mAutoUpdate.Checked() {
+							_ = setAutoUpdate(false)
+							mAutoUpdate.Uncheck()
+						} else {
+							_ = setAutoUpdate(true)
+							mAutoUpdate.Check()
 						}
 					case <-mQuit.ClickedCh:
 						_ = cmd.Process.Kill()
