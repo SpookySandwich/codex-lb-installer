@@ -37,6 +37,21 @@ var
   DeleteDataPage: TWizardPage;
   DeleteDataCheckBox: TNewCheckBox;
 
+procedure KillProcessByName(const FileName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill', '/F /IM ' + FileName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  KillProcessByName('launcher.exe');
+  KillProcessByName('python.exe');
+  Sleep(2000);
+  Result := '';
+end;
+
 procedure InitializeUninstallProgressForm();
 begin
   DeleteDataPage := CreateCustomPage(wpWelcome, 'Uninstall Options', 'Would you like to remove user data as well?');

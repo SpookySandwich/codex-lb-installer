@@ -212,11 +212,27 @@ func downloadAndInstall(url string) error {
 	}
 	file.Close()
 
-	// Launch the installer silently then return.
+	// Create a VBScript wrapper to run the installer completely hidden.
+	// This is necessary because Inno Setup shows a window even with /VERYSILENT
+	// when it detects files in use.
+	vbsPath := filepath.Join(tmpDir, "CodexLB_Update.vbs")
+	vbsContent := fmt.Sprintf(
+		`Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "\"%s\"" & " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART", 0, True`,
+		installerPath)
+
+	vbsFile, err := os.Create(vbsPath)
+	if err != nil {
+		return fmt.Errorf("failed to create VBScript: %w", err)
+	}
+	vbsFile.WriteString(vbsContent)
+	vbsFile.Close()
+
+	// Launch the VBScript wrapper to run installer hidden.
 	// The caller must exit the process so the installer can replace locked files.
-	installer := exec.Command(installerPath, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/FORCECLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS=No")
-	installer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return installer.Start()
+	vbs := exec.Command("cscript", "//nologo", vbsPath)
+	vbs.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return vbs.Start()
 }
 
 func main() {
