@@ -214,7 +214,7 @@ func downloadAndInstall(url string) error {
 
 	// Launch the installer silently then return.
 	// The caller must exit the process so the installer can replace locked files.
-	installer := exec.Command(installerPath, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
+	installer := exec.Command(installerPath, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/FORCECLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS=No")
 	installer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return installer.Start()
 }
@@ -290,11 +290,13 @@ func main() {
 			if err != nil || newTag == "" {
 				return
 			}
+			// Kill Python backend first to release file locks
+			_ = cmd.Process.Kill()
+			time.Sleep(2 * time.Second)
 			if err := downloadAndInstall(installerURL); err != nil {
 				return
 			}
-			// Kill Python backend, then exit so installer can replace locked files
-			_ = cmd.Process.Kill()
+			// Exit so installer can replace locked files
 			os.Exit(0)
 		}()
 	}
@@ -337,11 +339,13 @@ func main() {
 							if newTag == "" {
 								return // Already up to date
 							}
+							// Kill Python backend first to release file locks
+							_ = cmd.Process.Kill()
+							time.Sleep(2 * time.Second)
 							if err := downloadAndInstall(installerURL); err != nil {
 								return
 							}
-							// Kill Python backend, then exit so installer can replace locked files
-							_ = cmd.Process.Kill()
+							// Exit so installer can replace locked files
 							os.Exit(0)
 						}()
 					case <-mAutostart.ClickedCh:

@@ -18,6 +18,8 @@ DisableDirPage=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
+CloseApplications=no
+RestartApplications=no
 
 [Files]
 Source: "dist\bundle\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
