@@ -30,7 +30,7 @@
 
 ## 📥 快速开始
 
-1. 从 [Releases](https://github.com/SpookySandwich/CodexLB/releases) 页面下载最新的 `CodexLB_Installer.exe`。
+1. 从 [Releases](https://github.com/SpookySandwich/codex-lb-installer/releases) 页面下载最新的 `CodexLB_Installer.exe`。
 2. 运行安装向导并完成设置。
 3. 从桌面或开始菜单快捷方式启动应用。
 
@@ -53,8 +53,8 @@ CodexLB 通过系统托盘内置了自动更新机制：
 
 1. 克隆本仓库：
    ```bash
-   git clone https://github.com/SpookySandwich/CodexLB.git
-   cd CodexLB
+   git clone https://github.com/SpookySandwich/codex-lb-installer.git
+   cd codex-lb-installer
    ```
 2. 克隆目标仓库：
    ```bash

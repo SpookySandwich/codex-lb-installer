@@ -112,7 +112,7 @@ const (
 	registryRunKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
 	registryValueName    = "CodexLB"
 	registryAutoUpdate   = "CodexLBAutoUpdate"
-	githubAPIURL         = "https://api.github.com/repos/SpookySandwich/CodexLB/releases"
+	githubAPIURL         = "https://api.github.com/repos/SpookySandwich/codex-lb-installer/releases"
 )
 
 // currentVersion is set via ldflags at build time.

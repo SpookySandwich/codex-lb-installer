@@ -30,7 +30,7 @@ It packages the backend, frontend dashboard, and a portable Python runtime into 
 
 ## 📥 Quick Start
 
-1. Download the latest `CodexLB_Installer.exe` from the [Releases](https://github.com/SpookySandwich/CodexLB/releases) tab.
+1. Download the latest `CodexLB_Installer.exe` from the [Releases](https://github.com/SpookySandwich/codex-lb-installer/releases) tab.
 2. Run the installer wizard and complete setup.
 3. Launch the app from the Desktop or Start Menu shortcut.
 
@@ -53,8 +53,8 @@ If you want to compile the installer package locally:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/SpookySandwich/CodexLB.git
-   cd CodexLB
+   git clone https://github.com/SpookySandwich/codex-lb-installer.git
+   cd codex-lb-installer
    ```
 2. Clone the target repository:
    ```bash
