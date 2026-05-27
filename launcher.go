@@ -54,8 +54,8 @@ var lang = trayStrings{
 	Quit:            "Quit",
 	Tooltip:         "CodexLB",
 	UpdateAvailable: "Update Available",
-	UpToDate:        "CodexLB is up to date.",
-	InstallConfirm:  "New version %s found.\nInstall now?",
+	UpToDate:        "CodexLB is up to date (v%s).",
+	InstallConfirm:  "Current version: v%s\nNew version: v%s\n\nInstall now?",
 	DownloadFailed:  "Failed to download update.",
 	CheckFailed:     "Failed to check for updates.",
 }
@@ -98,8 +98,8 @@ func init() {
 			Quit:            "\u9000\u51fa",
 			Tooltip:         "CodexLB",
 			UpdateAvailable: "\u53d1\u73b0\u65b0\u7248\u672c",
-			UpToDate:        "CodexLB \u5df2\u662f\u6700\u65b0\u7248\u672c\u3002",
-			InstallConfirm:  "\u53d1\u73b0\u65b0\u7248\u672c %s\uff0c\u662f\u5426\u7acb\u5373\u5b89\u88c5\uff1f",
+			UpToDate:        "CodexLB \u5df2\u662f\u6700\u65b0\u7248\u672c (v%s)\u3002",
+			InstallConfirm:  "\u5f53\u524d\u7248\u672c: v%s\n\u65b0\u7248\u672c: v%s\n\n\u662f\u5426\u7acb\u5373\u5b89\u88c5\uff1f",
 			DownloadFailed:  "\u4e0b\u8f7d\u66f4\u65b0\u5931\u8d25\u3002",
 			CheckFailed:     "\u68c0\u67e5\u66f4\u65b0\u5931\u8d25\u3002",
 		}
@@ -462,7 +462,7 @@ func main() {
 				return
 			}
 			// Ask user to confirm installation
-			msg := fmt.Sprintf(lang.InstallConfirm, newTag)
+			msg := fmt.Sprintf(lang.InstallConfirm, currentVersion, newTag)
 			ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
 			if ret != IDYES {
 				return
@@ -516,11 +516,11 @@ func main() {
 								return
 							}
 							if newTag == "" {
-								showMessageBox("CodexLB", lang.UpToDate, MB_OK|MB_ICONINFO)
+								showMessageBox("CodexLB", fmt.Sprintf(lang.UpToDate, currentVersion), MB_OK|MB_ICONINFO)
 								return
 							}
 							// Ask user to confirm installation
-							msg := fmt.Sprintf(lang.InstallConfirm, newTag)
+							msg := fmt.Sprintf(lang.InstallConfirm, currentVersion, newTag)
 							ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
 							if ret != IDYES {
 								return
