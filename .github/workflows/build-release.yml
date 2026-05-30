@@ -81,6 +81,11 @@ jobs:
                   newest_stable_tag = rel["tag_name"]
                   break
 
+          # Always expose the newest stable tag so the self-heal step below can
+          # keep the "latest" badge correct even on runs where nothing is built.
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"newest_stable_tag={newest_stable_tag or ''}\n")
+
           # Decide what to build this run:
           #   1. Prefer the newest stable release if we haven't built it yet, so
           #      the latest stable release always syncs promptly and is never
@@ -214,7 +219,39 @@ jobs:
           make_latest: ${{ steps.check.outputs.make_latest }}
           body: |
             Automated Windows installer package for Codex Load Balancer version `${{ steps.check.outputs.tag_name }}`.
-            
+
             Double-click the installer to install. Launching the program will start Codex Load Balancer silently in the background and pop up the dashboard in your default browser.
           files: dist/CodexLB_Installer_*.exe
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Self-heal the "latest" badge on every run, regardless of whether a new
+      # build happened. GitHub does not always re-point "latest" to the newest
+      # stable release on its own (e.g. when releases are built out of
+      # chronological order), so we explicitly re-assert it here. This is a
+      # cheap, idempotent reconciliation: if the badge is already correct it is
+      # a no-op.
+      - name: Ensure newest stable release is marked latest
+        if: always() && steps.check.outputs.newest_stable_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEWEST_STABLE: ${{ steps.check.outputs.newest_stable_tag }}
+        run: |
+          set -euo pipefail
+
+          # Only reconcile if we actually have a build for the newest stable tag.
+          if ! gh release view "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "No release for $NEWEST_STABLE yet; skipping latest reconciliation."
+            exit 0
+          fi
+
+          current_latest=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+            --json tagName,isLatest --jq 'map(select(.isLatest)) | .[0].tagName // ""')
+
+          if [ "$current_latest" = "$NEWEST_STABLE" ]; then
+            echo "Latest badge already on $NEWEST_STABLE; nothing to do."
+          else
+            echo "Re-pointing latest badge from '${current_latest:-<none>}' to $NEWEST_STABLE."
+            gh release edit "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" \
+              --latest --prerelease=false
+          fi
