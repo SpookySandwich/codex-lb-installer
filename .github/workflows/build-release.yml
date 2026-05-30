@@ -72,28 +72,49 @@ jobs:
 
           print(f"Our existing tags: {sorted(our_tags)}")
 
-          # Find the most recent upstream release we haven't built yet.
+          # Identify the newest STABLE (non-prerelease) upstream release. This
+          # is the version that should always be tracked and marked as "latest".
           # Upstream releases are returned newest-first by GitHub.
+          newest_stable_tag = None
+          for rel in upstream_releases:
+              if not rel.get("prerelease"):
+                  newest_stable_tag = rel["tag_name"]
+                  break
+
+          # Decide what to build this run:
+          #   1. Prefer the newest stable release if we haven't built it yet, so
+          #      the latest stable release always syncs promptly and is never
+          #      masked by a more recent pre-release.
+          #   2. Otherwise fall back to the most recent release (including
+          #      pre-releases) we haven't built yet.
           target_tag = None
           target_prerelease = False
-          for rel in upstream_releases:
-              tag = rel["tag_name"]
-              if tag not in our_tags:
-                  target_tag = tag
-                  target_prerelease = bool(rel.get("prerelease"))
-                  break
+          if newest_stable_tag is not None and newest_stable_tag not in our_tags:
+              target_tag = newest_stable_tag
+              target_prerelease = False
+          else:
+              for rel in upstream_releases:
+                  if rel["tag_name"] not in our_tags:
+                      target_tag = rel["tag_name"]
+                      target_prerelease = bool(rel.get("prerelease"))
+                      break
 
           if target_tag is None:
               print("All upstream releases already built. Nothing to do.")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("build_needed=false\n")
           else:
+              # Only the newest stable release should be flagged as "latest";
+              # pre-releases and older stable backfills must not claim it.
+              make_latest = (not target_prerelease) and (target_tag == newest_stable_tag)
               label = "pre-release" if target_prerelease else "stable release"
               print(f"New {label} detected: {target_tag}. Building installer...")
+              print(f"Mark as latest release: {make_latest}")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("build_needed=true\n")
                   f.write(f"tag_name={target_tag}\n")
                   f.write(f"prerelease={str(target_prerelease).lower()}\n")
+                  f.write(f"make_latest={str(make_latest).lower()}\n")
 
       - name: Clone Target Repository at Tag
         if: steps.check.outputs.build_needed == 'true'
@@ -190,6 +211,7 @@ jobs:
           tag_name: ${{ steps.check.outputs.tag_name }}
           name: Release ${{ steps.check.outputs.tag_name }}
           prerelease: ${{ steps.check.outputs.prerelease }}
+          make_latest: ${{ steps.check.outputs.make_latest }}
           body: |
             Automated Windows installer package for Codex Load Balancer version `${{ steps.check.outputs.tag_name }}`.
             
