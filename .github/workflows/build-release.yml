@@ -30,21 +30,37 @@ jobs:
           import json
           import os
           import sys
+          import time
 
           my_repo = os.getenv("GITHUB_REPOSITORY")
           token = os.getenv("GITHUB_TOKEN")
 
+          # Authenticate every GitHub API call. Unauthenticated requests share a
+          # 60/hour limit per runner IP, which intermittently 403s the upstream
+          # release check; an authenticated token (valid against public repos
+          # too) raises this to 5000/hour and makes the check reliable.
+          api_headers = {"User-Agent": "Mozilla/5.0"}
+          if token:
+              api_headers["Authorization"] = f"token {token}"
+
           # Fetch ALL upstream releases (not just /latest, to handle pre-releases properly)
-          try:
-              req = urllib.request.Request(
-                  "https://api.github.com/repos/Soju06/codex-lb/releases?per_page=20",
-                  headers={"User-Agent": "Mozilla/5.0"}
-              )
-              with urllib.request.urlopen(req) as response:
-                  upstream_releases = json.loads(response.read().decode())
-          except Exception as e:
-              print(f"Error fetching upstream releases: {e}")
-              sys.exit(1)
+          # Retry transient failures (rate limits, blips) with a short backoff.
+          upstream_releases = None
+          for attempt in range(1, 6):
+              try:
+                  req = urllib.request.Request(
+                      "https://api.github.com/repos/Soju06/codex-lb/releases?per_page=20",
+                      headers=api_headers
+                  )
+                  with urllib.request.urlopen(req) as response:
+                      upstream_releases = json.loads(response.read().decode())
+                  break
+              except Exception as e:
+                  print(f"Attempt {attempt}/5 - error fetching upstream releases: {e}")
+                  if attempt == 5:
+                      print("Giving up after 5 attempts.")
+                      sys.exit(1)
+                  time.sleep(2 ** attempt)
 
           if not upstream_releases:
               print("No upstream releases found.")
@@ -61,7 +77,7 @@ jobs:
           try:
               req = urllib.request.Request(
                   f"https://api.github.com/repos/{my_repo}/releases?per_page=50",
-                  headers={"User-Agent": "Mozilla/5.0", "Authorization": f"token {token}"}
+                  headers=api_headers
               )
               with urllib.request.urlopen(req) as response:
                   our_releases = json.loads(response.read().decode())
