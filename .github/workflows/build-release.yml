@@ -253,21 +253,42 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEWEST_STABLE: ${{ steps.check.outputs.newest_stable_tag }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          # Only reconcile if we actually have a build for the newest stable tag.
-          if ! gh release view "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "No release for $NEWEST_STABLE yet; skipping latest reconciliation."
-            exit 0
-          fi
+          # This step is best-effort maintenance: the badge is re-checked on
+          # every run, so a transient API failure here must never fail the
+          # whole workflow (a flaky 401/403 once turned a healthy run into a
+          # failure email). Retry with backoff, then downgrade to a warning.
 
-          current_latest=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
-            --json tagName,isLatest --jq 'map(select(.isLatest)) | .[0].tagName // ""')
+          reconcile() {
+            # Only reconcile if we actually have a build for the newest stable tag.
+            if ! gh release view "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "No release for $NEWEST_STABLE yet; skipping latest reconciliation."
+              return 0
+            fi
 
-          if [ "$current_latest" = "$NEWEST_STABLE" ]; then
-            echo "Latest badge already on $NEWEST_STABLE; nothing to do."
-          else
-            echo "Re-pointing latest badge from '${current_latest:-<none>}' to $NEWEST_STABLE."
-            gh release edit "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" \
-              --latest --prerelease=false
-          fi
+            local current_latest
+            current_latest=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+              --json tagName,isLatest --jq 'map(select(.isLatest)) | .[0].tagName // ""') || return 1
+
+            if [ "$current_latest" = "$NEWEST_STABLE" ]; then
+              echo "Latest badge already on $NEWEST_STABLE; nothing to do."
+            else
+              echo "Re-pointing latest badge from '${current_latest:-<none>}' to $NEWEST_STABLE."
+              gh release edit "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" \
+                --latest --prerelease=false || return 1
+            fi
+          }
+
+          for attempt in 1 2 3 4 5; do
+            if reconcile; then
+              exit 0
+            fi
+            echo "Reconciliation attempt $attempt/5 failed."
+            if [ "$attempt" -lt 5 ]; then
+              sleep $((2 ** attempt))
+            fi
+          done
+
+          echo "::warning::Could not reconcile the latest-release badge after 5 attempts; it will be retried on the next scheduled run."
+          exit 0
