@@ -121,14 +121,36 @@ def embed_icon_resource():
         print("Windows resource created.")
 
 
+def get_build_sha() -> str:
+    """Upstream codex-lb commit this bundle is built from. The launcher's edge
+    channel compares it against the published edge release's sha marker.
+    CI sets CODEXLB_UPSTREAM_SHA; local builds fall back to the checkout."""
+    sha = os.environ.get("CODEXLB_UPSTREAM_SHA", "").strip()
+    if sha:
+        return sha
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=SRC_DIR, capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
 def copy_launcher():
     print("Compiling and copying launcher.exe...")
     embed_icon_resource()
     app_version = get_app_version()
+    ldflags = f"-H=windowsgui -X main.currentVersion={app_version}"
+    build_sha = get_build_sha()
+    if build_sha:
+        ldflags += f" -X main.buildSHA={build_sha}"
+        print(f"Build sha: {build_sha}")
     # Compile launcher.go — rsrc.syso is auto-linked when present in the package
     subprocess.run([
         "go", "build",
-        "-ldflags", f"-H=windowsgui -X main.currentVersion={app_version}",
+        "-ldflags", ldflags,
         "-o", str(BUNDLE_DIR / "launcher.exe"),
     ], cwd=WORKSPACE_DIR, check=True)
     print("launcher.exe compiled and copied to bundle.")

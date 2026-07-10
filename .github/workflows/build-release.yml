@@ -292,3 +292,160 @@ jobs:
 
           echo "::warning::Could not reconcile the latest-release badge after 5 attempts; it will be retried on the next scheduled run."
           exit 0
+
+  # ---------------------------------------------------------------------------
+  # Edge channel: a single rolling pre-release ("edge") rebuilt whenever
+  # upstream main moves, gated on upstream's unit test suite. The launcher's
+  # opt-in "Edge Channel" tray toggle follows it via the upstream-sha marker
+  # in the release body. The asset name is fixed so the release replaces
+  # itself in place — no tag or asset accumulation.
+  # ---------------------------------------------------------------------------
+  edge-check:
+    name: Check Upstream Main for Edge Build
+    runs-on: ubuntu-latest
+    outputs:
+      build_needed: ${{ steps.check.outputs.build_needed }}
+      sha: ${{ steps.check.outputs.sha }}
+      sha_short: ${{ steps.check.outputs.sha_short }}
+      subject: ${{ steps.check.outputs.subject }}
+    steps:
+      - name: Compare upstream main against the published edge build
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          sha=$(gh api repos/Soju06/codex-lb/branches/main --jq '.commit.sha')
+          # First line of the commit message, sanitized for use in outputs.
+          subject=$(gh api repos/Soju06/codex-lb/branches/main \
+            --jq '.commit.commit.message' | head -n 1 | tr -d '"`$\\')
+
+          published=$(gh release view edge --repo "$GITHUB_REPOSITORY" \
+            --json body --jq '.body' 2>/dev/null \
+            | grep -oiE 'upstream-sha: *[0-9a-f]{7,40}' \
+            | grep -oiE '[0-9a-f]{7,40}' | head -n 1 || true)
+
+          echo "Upstream main:  $sha"
+          echo "Published edge: ${published:-<none>}"
+
+          {
+            echo "sha=$sha"
+            echo "sha_short=${sha:0:7}"
+            echo "subject=$subject"
+            if [ "$sha" = "$published" ]; then
+              echo "build_needed=false"
+            else
+              echo "build_needed=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+  edge-test:
+    name: Gate Edge Build on Upstream Unit Tests
+    needs: edge-check
+    if: needs.edge-check.outputs.build_needed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone upstream at target commit
+        run: |
+          git init codex-lb-src
+          cd codex-lb-src
+          git remote add origin https://github.com/Soju06/codex-lb.git
+          git fetch --depth 1 origin ${{ needs.edge-check.outputs.sha }}
+          git checkout --detach FETCH_HEAD
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run upstream unit tests
+        run: |
+          cd codex-lb-src
+          uv sync
+          uv run pytest tests/unit -q
+
+  edge-build:
+    name: Build and Publish Edge Installer
+    needs: [edge-check, edge-test]
+    if: needs.edge-check.outputs.build_needed == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Our Repository
+        uses: actions/checkout@v4
+
+      - name: Clone upstream at target commit
+        shell: bash
+        run: |
+          rm -rf codex-lb-src
+          git init codex-lb-src
+          cd codex-lb-src
+          git remote add origin https://github.com/Soju06/codex-lb.git
+          git fetch --depth 1 origin ${{ needs.edge-check.outputs.sha }}
+          git checkout --detach FETCH_HEAD
+
+      - name: Setup Go compiler
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install build tools (Pillow, rsrc)
+        shell: bash
+        run: |
+          pip install Pillow
+          go install github.com/akavel/rsrc@latest
+
+      - name: Build Frontend Assets
+        shell: bash
+        run: |
+          cd codex-lb-src/frontend
+          npm install
+          npm run build
+
+      - name: Build and Package Installer
+        shell: pwsh
+        env:
+          CODEXLB_UPSTREAM_SHA: ${{ needs.edge-check.outputs.sha }}
+        run: |
+          python bundle_build.py
+
+      - name: Rename installer to fixed edge asset name
+        shell: bash
+        run: |
+          mv dist/CodexLB_Installer_*.exe dist/CodexLB_Installer_edge.exe
+
+      - name: Publish rolling edge release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: edge
+          name: Edge (upstream main auto-build)
+          prerelease: true
+          make_latest: false
+          body: |
+            Rolling Windows installer built automatically from the latest commit on
+            upstream [Soju06/codex-lb](https://github.com/Soju06/codex-lb) `main`.
+            Gated on upstream's unit test suite, but otherwise untested — prefer the
+            stable releases below unless you need an unreleased fix. The launcher's
+            opt-in **Edge Channel** tray setting follows this release automatically.
+
+            - Upstream commit: [`${{ needs.edge-check.outputs.sha_short }}`](https://github.com/Soju06/codex-lb/commit/${{ needs.edge-check.outputs.sha }}) — ${{ needs.edge-check.outputs.subject }}
+            - Build run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            upstream-sha: ${{ needs.edge-check.outputs.sha }}
+          files: dist/CodexLB_Installer_edge.exe
+          token: ${{ secrets.GITHUB_TOKEN }}

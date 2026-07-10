@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -38,6 +39,7 @@ type trayStrings struct {
 	OpenDashboard   string
 	StartOnLogon    string
 	AutoUpdate      string
+	EdgeChannel     string
 	CheckUpdates    string
 	Quit            string
 	Tooltip         string
@@ -52,6 +54,7 @@ var lang = trayStrings{
 	OpenDashboard:   "Open Dashboard",
 	StartOnLogon:    "Start on Windows Logon",
 	AutoUpdate:      "Auto Update",
+	EdgeChannel:     "Edge Channel (main-branch builds)",
 	CheckUpdates:    "Check for Updates",
 	Quit:            "Quit",
 	Tooltip:         "CodexLB",
@@ -96,6 +99,7 @@ func init() {
 			OpenDashboard:   "\u6253\u5f00\u4eea\u8868\u76d8",
 			StartOnLogon:    "\u5f00\u673a\u81ea\u52a8\u542f\u52a8",
 			AutoUpdate:      "\u81ea\u52a8\u66f4\u65b0",
+			EdgeChannel:     "\u5c1d\u9c9c\u901a\u9053\uff08\u4e3b\u5206\u652f\u6784\u5efa\uff09",
 			CheckUpdates:    "\u68c0\u67e5\u66f4\u65b0",
 			Quit:            "\u9000\u51fa",
 			Tooltip:         "CodexLB",
@@ -114,11 +118,21 @@ const (
 	registryRunKey       = `Software\Microsoft\Windows\CurrentVersion\Run`
 	registryValueName    = "CodexLB"
 	registryAutoUpdate   = "CodexLBAutoUpdate"
+	registryEdgeChannel  = "CodexLBEdgeChannel"
 	githubAPIURL         = "https://api.github.com/repos/SpookySandwich/codex-lb-installer/releases"
+
+	// edgeTagName is the rolling release CI republishes for every new commit
+	// on upstream main.
+	edgeTagName = "edge"
 )
 
-// currentVersion is set via ldflags at build time.
-var currentVersion string
+// currentVersion and buildSHA are set via ldflags at build time. buildSHA is
+// the upstream codex-lb commit the bundle was built from; the edge channel
+// compares it against the published edge build's marker.
+var (
+	currentVersion string
+	buildSHA       string
+)
 
 type installMode int
 
@@ -194,6 +208,29 @@ func setAutoUpdate(enabled bool) error {
 	return k.DeleteValue(registryAutoUpdate)
 }
 
+func isEdgeChannelEnabled() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+
+	val, _, err := k.GetIntegerValue(registryEdgeChannel)
+	return err == nil && val == 1
+}
+
+func setEdgeChannel(enabled bool) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, registryRunKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if enabled {
+		return k.SetDWordValue(registryEdgeChannel, 1)
+	}
+	return k.DeleteValue(registryEdgeChannel)
+}
+
 func setAutostart(enabled bool) error {
 	if enabled {
 		execPath, err := os.Executable()
@@ -217,14 +254,18 @@ func setAutostart(enabled bool) error {
 	}
 }
 
+// GitHubAsset represents a downloadable file attached to a release.
+type GitHubAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
 // GitHubRelease represents the GitHub API response for a release.
 type GitHubRelease struct {
-	TagName    string `json:"tag_name"`
-	Prerelease bool   `json:"prerelease"`
-	Assets     []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-	} `json:"assets"`
+	TagName    string        `json:"tag_name"`
+	Prerelease bool          `json:"prerelease"`
+	Body       string        `json:"body"`
+	Assets     []GitHubAsset `json:"assets"`
 }
 
 // versionCore removes tag prefixes such as "v" while preserving semver suffixes.
@@ -384,65 +425,141 @@ func isExeAsset(name string) bool {
 	return strings.HasSuffix(strings.ToLower(name), ".exe")
 }
 
-// checkForUpdates checks GitHub for a newer stable release.
-func checkForUpdates() (string, string, error) {
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-	resp, err := httpClient.Get(githubAPIURL)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to check for updates: %w", err)
+// pickInstallerAsset returns the download URL of a release's installer
+// executable. Prefers the named installer asset; falls back to the only .exe
+// when a release has not followed the naming convention.
+func pickInstallerAsset(rel GitHubRelease) string {
+	var exeURL string
+	exeCount := 0
+	for _, asset := range rel.Assets {
+		if isInstallerAsset(asset.Name) {
+			return asset.BrowserDownloadURL
+		}
+		if isExeAsset(asset.Name) {
+			exeURL = asset.BrowserDownloadURL
+			exeCount++
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if exeCount == 1 {
+		return exeURL
 	}
+	return ""
+}
 
-	var releases []GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
-		return "", "", fmt.Errorf("failed to parse releases: %w", err)
+var upstreamSHAPattern = regexp.MustCompile(`upstream-sha:\s*([0-9a-fA-F]{7,40})`)
+
+// parseUpstreamSHA extracts the upstream codex-lb commit hash from an edge
+// release body (marker line: "upstream-sha: <hex>").
+func parseUpstreamSHA(body string) string {
+	m := upstreamSHAPattern.FindStringSubmatch(body)
+	if m == nil {
+		return ""
 	}
+	return strings.ToLower(m[1])
+}
 
-	// Find the latest stable release that's actually newer than current version
-	var bestTag string
-	var bestURL string
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// updateCandidate describes an available update for the active channel.
+type updateCandidate struct {
+	newVersion string // display string, e.g. "v1.20.3" or "edge (abc1234)"
+	url        string
+}
+
+// findStableUpdate returns the newest stable release that is newer than the
+// current version, or nil when up to date.
+func findStableUpdate(releases []GitHubRelease, current string) *updateCandidate {
+	var bestTag, bestURL string
 	for _, rel := range releases {
 		if rel.Prerelease {
 			continue
 		}
-		if !isNewerVersion(rel.TagName, currentVersion) {
+		if !isNewerVersion(rel.TagName, current) {
 			continue
 		}
-		// This release is newer - check if it's the best we've found
 		if bestTag != "" && !isNewerVersion(rel.TagName, bestTag) {
 			continue
 		}
-		// Prefer the named installer executable. Fall back to the only .exe when a
-		// release has not followed the naming convention.
-		var installerURL string
-		var exeURL string
-		exeCount := 0
-		for _, asset := range rel.Assets {
-			if isInstallerAsset(asset.Name) {
-				installerURL = asset.BrowserDownloadURL
-				break
-			}
-			if isExeAsset(asset.Name) {
-				exeURL = asset.BrowserDownloadURL
-				exeCount++
-			}
-		}
-		if installerURL == "" && exeCount == 1 {
-			installerURL = exeURL
-		}
-		if installerURL != "" {
+		if url := pickInstallerAsset(rel); url != "" {
 			bestTag = rel.TagName
-			bestURL = installerURL
+			bestURL = url
 		}
 	}
 	if bestTag == "" {
-		return "", "", nil // Already up to date
+		return nil
 	}
-	return bestTag, bestURL, nil
+	return &updateCandidate{newVersion: displayVersion(bestTag), url: bestURL}
+}
+
+// findEdgeUpdate inspects the rolling edge release. The second return value
+// reports whether an edge release exists at all; the candidate is nil when up
+// to date or when the release is unusable (no sha marker, no asset) — never
+// offering an update we cannot identify prevents silent reinstall loops.
+func findEdgeUpdate(releases []GitHubRelease, installedSHA string) (*updateCandidate, bool) {
+	for _, rel := range releases {
+		if !strings.EqualFold(rel.TagName, edgeTagName) {
+			continue
+		}
+		sha := parseUpstreamSHA(rel.Body)
+		if sha == "" {
+			return nil, true
+		}
+		if installedSHA != "" && strings.EqualFold(sha, installedSHA) {
+			return nil, true
+		}
+		url := pickInstallerAsset(rel)
+		if url == "" {
+			return nil, true
+		}
+		return &updateCandidate{
+			newVersion: fmt.Sprintf("edge (%s)", shortSHA(sha)),
+			url:        url,
+		}, true
+	}
+	return nil, false
+}
+
+func fetchReleases() ([]GitHubRelease, error) {
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Get(githubAPIURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check for updates: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var releases []GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("failed to parse releases: %w", err)
+	}
+	return releases, nil
+}
+
+// checkForUpdates returns the available update for the active channel, or nil
+// when up to date. The edge channel follows the rolling build of upstream
+// main; the default channel follows stable releases only. When the edge
+// channel is enabled but no edge release has ever been published, fall back
+// to the stable channel so the user is never left without updates.
+func checkForUpdates() (*updateCandidate, error) {
+	releases, err := fetchReleases()
+	if err != nil {
+		return nil, err
+	}
+	if isEdgeChannelEnabled() {
+		cand, exists := findEdgeUpdate(releases, buildSHA)
+		if exists {
+			return cand, nil
+		}
+	}
+	return findStableUpdate(releases, currentVersion), nil
 }
 
 func downloadInstaller(url string) (string, error) {
@@ -516,8 +633,18 @@ func exitForUpdate(cmd *exec.Cmd) {
 	os.Exit(0)
 }
 
-func installConfirmMessage(newTag string) string {
-	return fmt.Sprintf(lang.InstallConfirm, displayVersion(currentVersion), displayVersion(newTag))
+// currentDisplay describes the installed build, including the upstream commit
+// when the edge channel is active so edge-to-edge updates are legible.
+func currentDisplay() string {
+	disp := displayVersion(currentVersion)
+	if isEdgeChannelEnabled() && buildSHA != "" {
+		return fmt.Sprintf("%s (%s)", disp, shortSHA(buildSHA))
+	}
+	return disp
+}
+
+func installConfirmMessage(newVersion string) string {
+	return fmt.Sprintf(lang.InstallConfirm, currentDisplay(), newVersion)
 }
 
 func main() {
@@ -587,11 +714,16 @@ func main() {
 		go func() {
 			// Wait a moment for the app to fully start
 			time.Sleep(10 * time.Second)
-			newTag, installerURL, err := checkForUpdates()
-			if err != nil || newTag == "" {
+			cand, err := checkForUpdates()
+			if err != nil || cand == nil {
 				return
 			}
-			if err := downloadAndLaunchInstaller(installerURL, installSilent); err != nil {
+			// A build without an embedded sha cannot tell whether an edge
+			// build is new; require the user-driven check for that first hop.
+			if isEdgeChannelEnabled() && buildSHA == "" {
+				return
+			}
+			if err := downloadAndLaunchInstaller(cand.url, installSilent); err != nil {
 				return
 			}
 			exitForUpdate(cmd)
@@ -609,7 +741,8 @@ func main() {
 			mOpen := systray.AddMenuItem(lang.OpenDashboard, "Open the web dashboard")
 			mAutostart := systray.AddMenuItemCheckbox(lang.StartOnLogon, "Start CodexLB automatically on startup", isAutostartEnabled())
 			mAutoUpdate := systray.AddMenuItemCheckbox(lang.AutoUpdate, "Automatically check and install updates on startup", isAutoUpdateEnabled())
-			mUpdate := systray.AddMenuItem(lang.CheckUpdates, "Check for new stable version and install if available")
+			mEdge := systray.AddMenuItemCheckbox(lang.EdgeChannel, "Update from rolling builds of upstream main instead of stable releases", isEdgeChannelEnabled())
+			mUpdate := systray.AddMenuItem(lang.CheckUpdates, "Check for a new version on the active channel and install if available")
 			systray.AddSeparator()
 			mQuit := systray.AddMenuItem(lang.Quit, "Stop CodexLB")
 
@@ -629,22 +762,22 @@ func main() {
 						_ = openURL(url)
 					case <-mUpdate.ClickedCh:
 						go func() {
-							newTag, installerURL, err := checkForUpdates()
+							cand, err := checkForUpdates()
 							if err != nil {
 								showMessageBox("CodexLB", lang.CheckFailed, MB_OK|MB_ICONERROR)
 								return
 							}
-							if newTag == "" {
-								showMessageBox("CodexLB", fmt.Sprintf(lang.UpToDate, displayVersion(currentVersion)), MB_OK|MB_ICONINFO)
+							if cand == nil {
+								showMessageBox("CodexLB", fmt.Sprintf(lang.UpToDate, currentDisplay()), MB_OK|MB_ICONINFO)
 								return
 							}
 							// Ask user to confirm installation
-							msg := installConfirmMessage(newTag)
+							msg := installConfirmMessage(cand.newVersion)
 							ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
 							if ret != IDYES {
 								return
 							}
-							if err := downloadAndLaunchInstaller(installerURL, installVisible); err != nil {
+							if err := downloadAndLaunchInstaller(cand.url, installVisible); err != nil {
 								showMessageBox("CodexLB", lang.DownloadFailed, MB_OK|MB_ICONERROR)
 								return
 							}
@@ -665,6 +798,14 @@ func main() {
 						} else {
 							_ = setAutoUpdate(true)
 							mAutoUpdate.Check()
+						}
+					case <-mEdge.ClickedCh:
+						if mEdge.Checked() {
+							_ = setEdgeChannel(false)
+							mEdge.Uncheck()
+						} else {
+							_ = setEdgeChannel(true)
+							mEdge.Check()
 						}
 					case <-mQuit.ClickedCh:
 						_ = cmd.Process.Kill()
