@@ -3,7 +3,6 @@ dist/
 build/
 *.exe
 rsrc.syso
-codex_lb_icon.ico
 
 # Python temporary files
 *.zip

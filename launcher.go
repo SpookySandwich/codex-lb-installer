@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -21,29 +23,29 @@ import (
 var iconICO []byte
 
 var (
-	shell32           = syscall.NewLazyDLL("shell32.dll")
-	procShellExecuteW = shell32.NewProc("ShellExecuteW")
-	user32            = syscall.NewLazyDLL("user32.dll")
-	procMessageBoxW   = user32.NewProc("MessageBoxW")
-	kernel32          = syscall.NewLazyDLL("kernel32.dll")
-	procCreateMutexW  = kernel32.NewProc("CreateMutexW")
-	procCloseHandle   = kernel32.NewProc("CloseHandle")
+	shell32                = syscall.NewLazyDLL("shell32.dll")
+	procShellExecuteW      = shell32.NewProc("ShellExecuteW")
+	user32                 = syscall.NewLazyDLL("user32.dll")
+	procMessageBoxW        = user32.NewProc("MessageBoxW")
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutexW       = kernel32.NewProc("CreateMutexW")
+	procCloseHandle        = kernel32.NewProc("CloseHandle")
 	procGetUserDefaultLCID = kernel32.NewProc("GetUserDefaultLCID")
 )
 
 // Tray menu strings - auto-detected based on system locale
 type trayStrings struct {
-	OpenDashboard    string
-	StartOnLogon     string
-	AutoUpdate       string
-	CheckUpdates     string
-	Quit             string
-	Tooltip          string
-	UpdateAvailable  string
-	UpToDate         string
-	InstallConfirm   string
-	DownloadFailed   string
-	CheckFailed      string
+	OpenDashboard   string
+	StartOnLogon    string
+	AutoUpdate      string
+	CheckUpdates    string
+	Quit            string
+	Tooltip         string
+	UpdateAvailable string
+	UpToDate        string
+	InstallConfirm  string
+	DownloadFailed  string
+	CheckFailed     string
 }
 
 var lang = trayStrings{
@@ -54,8 +56,8 @@ var lang = trayStrings{
 	Quit:            "Quit",
 	Tooltip:         "CodexLB",
 	UpdateAvailable: "Update Available",
-	UpToDate:        "CodexLB is up to date (v%s).",
-	InstallConfirm:  "Current version: v%s\nNew version: v%s\n\nInstall now?",
+	UpToDate:        "CodexLB is up to date (%s).",
+	InstallConfirm:  "Current version: %s\nNew version: %s\n\nInstall now?",
 	DownloadFailed:  "Failed to download update.",
 	CheckFailed:     "Failed to check for updates.",
 }
@@ -85,7 +87,7 @@ func isChineseLocale() bool {
 	lcid, _, _ := procGetUserDefaultLCID.Call()
 	// Chinese Simplified: 0x0804, Chinese Traditional: 0x0404
 	// LCID & 0xFF == 0x04 means Chinese
-	return (lcid&0x3FF) == 0x004
+	return (lcid & 0x3FF) == 0x004
 }
 
 func init() {
@@ -98,8 +100,8 @@ func init() {
 			Quit:            "\u9000\u51fa",
 			Tooltip:         "CodexLB",
 			UpdateAvailable: "\u53d1\u73b0\u65b0\u7248\u672c",
-			UpToDate:        "CodexLB \u5df2\u662f\u6700\u65b0\u7248\u672c (v%s)\u3002",
-			InstallConfirm:  "\u5f53\u524d\u7248\u672c: v%s\n\u65b0\u7248\u672c: v%s\n\n\u662f\u5426\u7acb\u5373\u5b89\u88c5\uff1f",
+			UpToDate:        "CodexLB \u5df2\u662f\u6700\u65b0\u7248\u672c (%s)\u3002",
+			InstallConfirm:  "\u5f53\u524d\u7248\u672c: %s\n\u65b0\u7248\u672c: %s\n\n\u662f\u5426\u7acb\u5373\u5b89\u88c5\uff1f",
 			DownloadFailed:  "\u4e0b\u8f7d\u66f4\u65b0\u5931\u8d25\u3002",
 			CheckFailed:     "\u68c0\u67e5\u66f4\u65b0\u5931\u8d25\u3002",
 		}
@@ -117,6 +119,13 @@ const (
 
 // currentVersion is set via ldflags at build time.
 var currentVersion string
+
+type installMode int
+
+const (
+	installVisible installMode = iota
+	installSilent
+)
 
 func createNamedMutex(name string) (uintptr, error) {
 	namePtr, err := syscall.UTF16PtrFromString(name)
@@ -218,38 +227,161 @@ type GitHubRelease struct {
 	} `json:"assets"`
 }
 
-// parseVersion extracts major, minor, patch from a version string like "v1.19.0" or "1.19.0-beta.1".
-func parseVersion(v string) (int, int, int) {
-	// Strip leading 'v'
-	if len(v) > 0 && v[0] == 'v' {
-		v = v[1:]
-	}
-	// Strip suffix like "-beta.1"
-	for i, c := range v {
-		if c == '-' {
-			v = v[:i]
-			break
+// versionCore removes tag prefixes such as "v" while preserving semver suffixes.
+func versionCore(v string) string {
+	v = strings.TrimSpace(v)
+	for i := 0; i < len(v); i++ {
+		if v[i] >= '0' && v[i] <= '9' {
+			return v[i:]
 		}
 	}
-	var major, minor, patch int
-	n, _ := fmt.Sscanf(v, "%d.%d.%d", &major, &minor, &patch)
-	if n < 1 {
+	return v
+}
+
+func displayVersion(v string) string {
+	v = versionCore(v)
+	if v == "" {
+		return "unknown"
+	}
+	if v[0] >= '0' && v[0] <= '9' {
+		return "v" + v
+	}
+	return v
+}
+
+type semanticVersion struct {
+	major      int
+	minor      int
+	patch      int
+	prerelease []string
+	valid      bool
+}
+
+func parseSemanticVersion(v string) semanticVersion {
+	v = versionCore(v)
+	if build := strings.IndexByte(v, '+'); build >= 0 {
+		v = v[:build]
+	}
+
+	var prerelease []string
+	if pre := strings.IndexByte(v, '-'); pre >= 0 {
+		prerelease = strings.Split(v[pre+1:], ".")
+		v = v[:pre]
+	}
+
+	parts := strings.Split(v, ".")
+	if len(parts) == 0 {
+		return semanticVersion{}
+	}
+
+	nums := [3]int{}
+	for i := 0; i < len(parts) && i < len(nums); i++ {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return semanticVersion{}
+		}
+		nums[i] = n
+	}
+
+	return semanticVersion{
+		major:      nums[0],
+		minor:      nums[1],
+		patch:      nums[2],
+		prerelease: prerelease,
+		valid:      true,
+	}
+}
+
+// parseVersion extracts major, minor, patch from a version string like "v1.19.0" or "1.19.0-beta.1".
+func parseVersion(v string) (int, int, int) {
+	parsed := parseSemanticVersion(v)
+	if !parsed.valid {
 		return 0, 0, 0
 	}
-	return major, minor, patch
+	return parsed.major, parsed.minor, parsed.patch
 }
 
 // isNewerVersion returns true if version a is newer than version b.
 func isNewerVersion(a, b string) bool {
-	am, ami, ap := parseVersion(a)
-	bm, bmi, bp := parseVersion(b)
-	if am != bm {
-		return am > bm
+	av := parseSemanticVersion(a)
+	bv := parseSemanticVersion(b)
+	if !av.valid {
+		return false
 	}
-	if ami != bmi {
-		return ami > bmi
+	if !bv.valid {
+		return true
 	}
-	return ap > bp
+	if av.major != bv.major {
+		return av.major > bv.major
+	}
+	if av.minor != bv.minor {
+		return av.minor > bv.minor
+	}
+	if av.patch != bv.patch {
+		return av.patch > bv.patch
+	}
+	return comparePrerelease(av.prerelease, bv.prerelease) > 0
+}
+
+func comparePrerelease(a, b []string) int {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	if len(a) == 0 {
+		return 1
+	}
+	if len(b) == 0 {
+		return -1
+	}
+
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	for i := 0; i < limit; i++ {
+		if cmp := comparePrereleaseIdentifier(a[i], b[i]); cmp != 0 {
+			return cmp
+		}
+	}
+	switch {
+	case len(a) > len(b):
+		return 1
+	case len(a) < len(b):
+		return -1
+	default:
+		return 0
+	}
+}
+
+func comparePrereleaseIdentifier(a, b string) int {
+	ai, aErr := strconv.Atoi(a)
+	bi, bErr := strconv.Atoi(b)
+	switch {
+	case aErr == nil && bErr == nil:
+		switch {
+		case ai > bi:
+			return 1
+		case ai < bi:
+			return -1
+		default:
+			return 0
+		}
+	case aErr == nil:
+		return -1
+	case bErr == nil:
+		return 1
+	default:
+		return strings.Compare(a, b)
+	}
+}
+
+func isInstallerAsset(name string) bool {
+	name = strings.ToLower(name)
+	return strings.HasSuffix(name, ".exe") && strings.Contains(name, "installer")
+}
+
+func isExeAsset(name string) bool {
+	return strings.HasSuffix(strings.ToLower(name), ".exe")
 }
 
 // checkForUpdates checks GitHub for a newer stable release.
@@ -284,13 +416,23 @@ func checkForUpdates() (string, string, error) {
 		if bestTag != "" && !isNewerVersion(rel.TagName, bestTag) {
 			continue
 		}
-		// Find installer asset
+		// Prefer the named installer executable. Fall back to the only .exe when a
+		// release has not followed the naming convention.
 		var installerURL string
+		var exeURL string
+		exeCount := 0
 		for _, asset := range rel.Assets {
-			if len(asset.Name) > 4 && asset.Name[len(asset.Name)-4:] == ".exe" {
+			if isInstallerAsset(asset.Name) {
 				installerURL = asset.BrowserDownloadURL
 				break
 			}
+			if isExeAsset(asset.Name) {
+				exeURL = asset.BrowserDownloadURL
+				exeCount++
+			}
+		}
+		if installerURL == "" && exeCount == 1 {
+			installerURL = exeURL
 		}
 		if installerURL != "" {
 			bestTag = rel.TagName
@@ -303,91 +445,79 @@ func checkForUpdates() (string, string, error) {
 	return bestTag, bestURL, nil
 }
 
-// downloadAndInstall downloads the installer and launches it silently.
-// The caller should exit the process after this returns so the installer
-// can replace the locked launcher.exe file.
-func downloadAndInstall(url string) error {
-	tmpDir := os.TempDir()
-	installerPath := filepath.Join(tmpDir, "CodexLB_Installer_Update.exe")
-
-	// Download the installer
+func downloadInstaller(url string) (string, error) {
 	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Get(url)
 	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		return "", fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
+		return "", fmt.Errorf("download failed with status: %d", resp.StatusCode)
 	}
 
-	file, err := os.Create(installerPath)
+	file, err := os.CreateTemp(os.TempDir(), "CodexLB_Installer_Update_*.exe")
 	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+		return "", fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
+	installerPath := file.Name()
+	downloaded := false
+	defer func() {
+		_ = file.Close()
+		if !downloaded {
+			_ = os.Remove(installerPath)
+		}
+	}()
 
 	if _, err := file.ReadFrom(resp.Body); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+		return "", fmt.Errorf("failed to write file: %w", err)
 	}
-	file.Close()
-
-	// Create a VBScript wrapper to run the installer completely hidden.
-	// This is necessary because Inno Setup shows a window even with /VERYSILENT
-	// when it detects files in use.
-	vbsPath := filepath.Join(tmpDir, "CodexLB_Update.vbs")
-	vbsContent := fmt.Sprintf(
-		`Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "\"%s\"" & " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART", 0, True`,
-		installerPath)
-
-	vbsFile, err := os.Create(vbsPath)
-	if err != nil {
-		return fmt.Errorf("failed to create VBScript: %w", err)
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("failed to finalize installer: %w", err)
 	}
-	vbsFile.WriteString(vbsContent)
-	vbsFile.Close()
-
-	// Launch the VBScript wrapper to run installer hidden.
-	// The caller must exit the process so the installer can replace locked files.
-	vbs := exec.Command("cscript", "//nologo", vbsPath)
-	vbs.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return vbs.Start()
+	downloaded = true
+	return installerPath, nil
 }
 
-// downloadAndInstallVisible downloads the installer and runs it with the window visible.
-// Used when the user manually clicks "Check for Updates" and confirms installation.
-func downloadAndInstallVisible(url string) error {
-	tmpDir := os.TempDir()
-	installerPath := filepath.Join(tmpDir, "CodexLB_Installer_Update.exe")
-
-	// Download the installer
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+func installerArgs(mode installMode) []string {
+	args := []string{
+		"/NORESTART",
+		"/LOG=" + filepath.Join(os.TempDir(), "CodexLB_Update.log"),
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
+	if mode == installSilent {
+		args = append(args, "/VERYSILENT", "/SUPPRESSMSGBOXES")
 	}
+	return args
+}
 
-	file, err := os.Create(installerPath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+func launchInstaller(installerPath string, mode installMode) error {
+	installer := exec.Command(installerPath, installerArgs(mode)...)
+	if mode == installSilent {
+		installer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	}
-	defer file.Close()
-
-	if _, err := file.ReadFrom(resp.Body); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-	file.Close()
-
-	// Launch the installer with window visible (no /VERYSILENT).
-	installer := exec.Command(installerPath, "/NORESTART")
 	return installer.Start()
+}
+
+// downloadAndLaunchInstaller stages the installer before the launcher exits.
+// Exiting first races the backend-death watcher and can abort the update.
+func downloadAndLaunchInstaller(url string, mode installMode) error {
+	installerPath, err := downloadInstaller(url)
+	if err != nil {
+		return err
+	}
+	return launchInstaller(installerPath, mode)
+}
+
+func exitForUpdate(cmd *exec.Cmd) {
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	os.Exit(0)
+}
+
+func installConfirmMessage(newTag string) string {
+	return fmt.Sprintf(lang.InstallConfirm, displayVersion(currentVersion), displayVersion(newTag))
 }
 
 func main() {
@@ -461,21 +591,10 @@ func main() {
 			if err != nil || newTag == "" {
 				return
 			}
-			// Ask user to confirm installation
-			msg := fmt.Sprintf(lang.InstallConfirm, currentVersion, newTag)
-			ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
-			if ret != IDYES {
+			if err := downloadAndLaunchInstaller(installerURL, installSilent); err != nil {
 				return
 			}
-			// Kill Python backend first to release file locks
-			_ = cmd.Process.Kill()
-			time.Sleep(2 * time.Second)
-			if err := downloadAndInstallVisible(installerURL); err != nil {
-				showMessageBox("CodexLB", lang.DownloadFailed, MB_OK|MB_ICONERROR)
-				return
-			}
-			// Exit so installer can replace locked files
-			os.Exit(0)
+			exitForUpdate(cmd)
 		}()
 	}
 
@@ -516,24 +635,20 @@ func main() {
 								return
 							}
 							if newTag == "" {
-								showMessageBox("CodexLB", fmt.Sprintf(lang.UpToDate, currentVersion), MB_OK|MB_ICONINFO)
+								showMessageBox("CodexLB", fmt.Sprintf(lang.UpToDate, displayVersion(currentVersion)), MB_OK|MB_ICONINFO)
 								return
 							}
 							// Ask user to confirm installation
-							msg := fmt.Sprintf(lang.InstallConfirm, currentVersion, newTag)
+							msg := installConfirmMessage(newTag)
 							ret := showMessageBox(lang.UpdateAvailable, msg, MB_YESNO|MB_ICONQUESTION)
 							if ret != IDYES {
 								return
 							}
-							// Kill Python backend first to release file locks
-							_ = cmd.Process.Kill()
-							time.Sleep(2 * time.Second)
-							if err := downloadAndInstallVisible(installerURL); err != nil {
+							if err := downloadAndLaunchInstaller(installerURL, installVisible); err != nil {
 								showMessageBox("CodexLB", lang.DownloadFailed, MB_OK|MB_ICONERROR)
 								return
 							}
-							// Exit so installer can replace locked files
-							os.Exit(0)
+							exitForUpdate(cmd)
 						}()
 					case <-mAutostart.ClickedCh:
 						if mAutostart.Checked() {
