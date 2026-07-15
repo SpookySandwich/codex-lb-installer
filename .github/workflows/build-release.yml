@@ -156,6 +156,10 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Bun
+        if: steps.check.outputs.build_needed == 'true'
+        uses: oven-sh/setup-bun@v2
+
       - name: Setup Python
         if: steps.check.outputs.build_needed == 'true'
         uses: actions/setup-python@v5
@@ -216,8 +220,13 @@ jobs:
         shell: bash
         run: |
           cd codex-lb-src/frontend
-          npm install
-          npm run build
+          # Upstream migrated the frontend to Bun (packageManager bun, bun.lock,
+          # and a build script that invokes `bun`), so bun is required to build.
+          # Plain `bun install` (no --frozen-lockfile) so this also works for
+          # older release tags that predate the bun migration and ship only a
+          # package.json / package-lock.json.
+          bun install
+          bun run build
 
       - name: Build and Package Installer
         if: steps.check.outputs.build_needed == 'true'
@@ -394,6 +403,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -414,8 +426,10 @@ jobs:
         shell: bash
         run: |
           cd codex-lb-src/frontend
-          npm install
-          npm run build
+          # Edge builds always track upstream main, which uses Bun and ships a
+          # committed bun.lock, so install against the lockfile for reproducibility.
+          bun install --frozen-lockfile
+          bun run build
 
       - name: Build and Package Installer
         shell: pwsh
