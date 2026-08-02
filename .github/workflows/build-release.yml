@@ -381,12 +381,15 @@ jobs:
           fi
 
           assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
+          # jq on the Windows runner terminates lines with CRLF and mapfile -t
+          # strips only the newline, so the trailing CR would ride along into
+          # the delete URL and gh would reject it as a control character.
           mapfile -t extra_asset_ids < <(printf '%s' "$assets" | jq -r --arg expected "$expected_asset" '
             .[] | select(
               (.name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")) and
               .name != $expected
             ) | .id
-          ')
+          ' | tr -d '\r')
           for asset_id in "${extra_asset_ids[@]}"; do
             echo "Deleting ambiguous installer asset id $asset_id from $TARGET_TAG."
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
@@ -705,12 +708,15 @@ jobs:
           fi
 
           assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
+          # jq on the Windows runner terminates lines with CRLF and mapfile -t
+          # strips only the newline, so the trailing CR would ride along into
+          # the delete URL and gh would reject it as a control character.
           mapfile -t asset_ids < <(printf '%s' "$assets" | jq -r --arg expected "$EXPECTED_ASSET" '
             .[] | select(
               (.name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")) and
               .name != $expected
             ) | .id
-          ')
+          ' | tr -d '\r')
           for asset_id in "${asset_ids[@]}"; do
             echo "Deleting superseded edge asset id $asset_id."
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
