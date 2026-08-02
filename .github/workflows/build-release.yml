@@ -14,7 +14,11 @@ permissions:
 jobs:
   check-and-build:
     name: Check for New Releases and Build
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    concurrency:
+      group: stable-publish-${{ github.repository }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout Our Repository
@@ -25,15 +29,36 @@ jobs:
         shell: python
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONPATH: ${{ github.workspace }}
+          WRAPPER_SHA: ${{ github.sha }}
         run: |
           import urllib.request
           import json
           import os
+          import re
           import sys
           import time
 
+          from release_policy import (
+              has_verified_installer,
+              installer_name_for_tag,
+              newest_release,
+              release_is_supported,
+          )
+
           my_repo = os.getenv("GITHUB_REPOSITORY")
           token = os.getenv("GITHUB_TOKEN")
+          wrapper_sha = os.environ["WRAPPER_SHA"].strip().lower()
+          if re.fullmatch(r"[0-9a-f]{40}", wrapper_sha) is None:
+              raise SystemExit(f"Invalid wrapper commit identity: {wrapper_sha!r}")
+
+          max_api_bytes = 8 * 1024 * 1024
+
+          def read_api_json(response):
+              body = response.read(max_api_bytes + 1)
+              if len(body) > max_api_bytes:
+                  raise ValueError("GitHub API response exceeded the 8 MiB limit")
+              return json.loads(body.decode("utf-8"))
 
           # Authenticate every GitHub API call. Unauthenticated requests share a
           # 60/hour limit per runner IP, which intermittently 403s the upstream
@@ -52,8 +77,10 @@ jobs:
                       "https://api.github.com/repos/Soju06/codex-lb/releases?per_page=20",
                       headers=api_headers
                   )
-                  with urllib.request.urlopen(req) as response:
-                      upstream_releases = json.loads(response.read().decode())
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      upstream_releases = read_api_json(response)
+                  if not isinstance(upstream_releases, list):
+                      raise ValueError("GitHub upstream releases response was not a list")
                   break
               except Exception as e:
                   print(f"Attempt {attempt}/5 - error fetching upstream releases: {e}")
@@ -72,53 +99,94 @@ jobs:
           for r in upstream_releases:
               pre = "[PRE-RELEASE]" if r.get("prerelease") else "[STABLE]"
               print(f"  {pre} {r['tag_name']}")
+          upstream_release_by_tag = {
+              release["tag_name"]: release for release in upstream_releases
+              if not release.get("draft")
+          }
 
-          # Fetch our existing release tags
+          # Fetch our existing, usable releases.
           try:
               req = urllib.request.Request(
                   f"https://api.github.com/repos/{my_repo}/releases?per_page=50",
                   headers=api_headers
               )
-              with urllib.request.urlopen(req) as response:
-                  our_releases = json.loads(response.read().decode())
-                  our_tags = {r["tag_name"] for r in our_releases}
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  our_releases = read_api_json(response)
+                  if not isinstance(our_releases, list):
+                      raise ValueError("GitHub installer releases response was not a list")
+                  our_tags = {
+                      release["tag_name"]
+                      for release in our_releases
+                      if has_verified_installer(release, upstream_release_by_tag)
+                  }
+                  current_wrapper_tags = {
+                      release["tag_name"]
+                      for release in our_releases
+                      if has_verified_installer(release, upstream_release_by_tag)
+                      and re.search(
+                          rf"(?im)^wrapper-sha:\s*{re.escape(wrapper_sha)}\s*$",
+                          release.get("body") or "",
+                      )
+                  }
+                  for release in our_releases:
+                      if release["tag_name"] != "edge" and release["tag_name"] not in our_tags:
+                          print(
+                              f"Release {release['tag_name']!r} is incomplete or unverifiable; "
+                              "it remains eligible for rebuilding."
+                          )
           except Exception as e:
               print(f"Error fetching our releases: {e}")
               our_tags = set()
+              current_wrapper_tags = set()
 
           print(f"Our existing tags: {sorted(our_tags)}")
+          print(f"Tags built with this wrapper: {sorted(current_wrapper_tags)}")
 
-          # Identify the newest STABLE (non-prerelease) upstream release. This
-          # is the version that should always be tracked and marked as "latest".
-          # Upstream releases are returned newest-first by GitHub.
-          newest_stable_tag = None
-          for rel in upstream_releases:
-              if not rel.get("prerelease"):
-                  newest_stable_tag = rel["tag_name"]
-                  break
+          # Use the same strict SemVer precedence as the runtime updater rather
+          # than GitHub's creation-time ordering. Otherwise a late backfill of
+          # an older release can receive the wrapper rebuild while clients are
+          # checking a different, semantically newer release.
+          supported_releases = [
+              release for release in upstream_releases
+              if release_is_supported(release)
+          ]
+          for release in upstream_releases:
+              if release not in supported_releases:
+                  print(f"Skipping unsupported or draft upstream release {release.get('tag_name')!r}.")
+
+          stable_releases = [release for release in supported_releases if not release.get("prerelease")]
+          newest_stable_release = newest_release(stable_releases)
+          newest_stable_tag = newest_stable_release["tag_name"] if newest_stable_release else None
 
           # Always expose the newest stable tag so the self-heal step below can
           # keep the "latest" badge correct even on runs where nothing is built.
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"newest_stable_tag={newest_stable_tag or ''}\n")
+              f.write(
+                  "newest_stable_asset="
+                  f"{installer_name_for_tag(newest_stable_tag) if newest_stable_tag else ''}\n"
+              )
 
           # Decide what to build this run:
           #   1. Prefer the newest stable release if we haven't built it yet, so
           #      the latest stable release always syncs promptly and is never
           #      masked by a more recent pre-release.
-          #   2. Otherwise fall back to the most recent release (including
-          #      pre-releases) we haven't built yet.
+          #   2. Otherwise fall back to the semantically newest release
+          #      (including pre-releases) we haven't built yet.
           target_tag = None
           target_prerelease = False
-          if newest_stable_tag is not None and newest_stable_tag not in our_tags:
+          if newest_stable_tag is not None and newest_stable_tag not in current_wrapper_tags:
               target_tag = newest_stable_tag
               target_prerelease = False
           else:
-              for rel in upstream_releases:
-                  if rel["tag_name"] not in our_tags:
-                      target_tag = rel["tag_name"]
-                      target_prerelease = bool(rel.get("prerelease"))
-                      break
+              unbuilt_releases = [
+                  release for release in supported_releases
+                  if release["tag_name"] not in our_tags
+              ]
+              target_release = newest_release(unbuilt_releases)
+              if target_release is not None:
+                  target_tag = target_release["tag_name"]
+                  target_prerelease = bool(target_release.get("prerelease"))
 
           if target_tag is None:
               print("All upstream releases already built. Nothing to do.")
@@ -140,15 +208,21 @@ jobs:
       - name: Clone Target Repository at Tag
         if: steps.check.outputs.build_needed == 'true'
         shell: bash
+        env:
+          TARGET_TAG: ${{ steps.check.outputs.tag_name }}
         run: |
           rm -rf codex-lb-src
-          git clone --depth 1 --branch ${{ steps.check.outputs.tag_name }} https://github.com/Soju06/codex-lb.git codex-lb-src
+          git clone --depth 1 --branch "$TARGET_TAG" https://github.com/Soju06/codex-lb.git codex-lb-src
 
       - name: Setup Go compiler
         if: steps.check.outputs.build_needed == 'true'
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
+
+      - name: Test launcher
+        if: steps.check.outputs.build_needed == 'true'
+        run: go test ./...
 
       - name: Setup Node.js
         if: steps.check.outputs.build_needed == 'true'
@@ -166,11 +240,43 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Test bundle builder
+        if: steps.check.outputs.build_needed == 'true'
+        run: python -m unittest -v test_bundle_build.py test_release_policy.py
+
+      - name: Validate target tag matches package version
+        if: steps.check.outputs.build_needed == 'true'
+        shell: python
+        env:
+          TARGET_TAG: ${{ steps.check.outputs.tag_name }}
+        run: |
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          tag = os.environ["TARGET_TAG"]
+          first_digit = re.search(r"\d", tag)
+          if first_digit is None:
+              raise SystemExit(f"Release tag has no version component: {tag!r}")
+          tag_version = tag[first_digit.start():]
+
+          pyproject_path = pathlib.Path("codex-lb-src/pyproject.toml")
+          pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+          package_version = pyproject["project"]["version"]
+          if package_version != tag_version:
+              raise SystemExit(
+                  f"Release tag {tag!r} resolves to {tag_version!r}, but "
+                  f"pyproject.toml declares {package_version!r}"
+              )
+          print(f"Validated release tag {tag!r} against package version {package_version!r}.")
+
       - name: Setup uv
         if: steps.check.outputs.build_needed == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          version: '0.11.29'
 
       - name: Patch frontend for recharts type compatibility
         if: steps.check.outputs.build_needed == 'true'
@@ -212,8 +318,8 @@ jobs:
         if: steps.check.outputs.build_needed == 'true'
         shell: bash
         run: |
-          pip install Pillow
-          go install github.com/akavel/rsrc@latest
+          pip install Pillow==12.3.0
+          go install github.com/akavel/rsrc@v0.10.2
 
       - name: Build Frontend Assets
         if: steps.check.outputs.build_needed == 'true'
@@ -231,11 +337,63 @@ jobs:
       - name: Build and Package Installer
         if: steps.check.outputs.build_needed == 'true'
         shell: pwsh
+        env:
+          CODEXLB_WRAPPER_SHA: ${{ github.sha }}
         run: |
           python bundle_build.py
 
-      - name: Create Release and Upload Asset
+      - name: Verify stable wrapper target is still current
+        id: stable-freshness
         if: steps.check.outputs.build_needed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest_wrapper_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')
+          if [ "$latest_wrapper_sha" != "$GITHUB_SHA" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping stale wrapper build $GITHUB_SHA; wrapper main is now $latest_wrapper_sha."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove ambiguous stable installer assets
+        if: steps.stable-freshness.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ steps.check.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          built_installers=(dist/CodexLB_Installer_*.exe)
+          if [ "${#built_installers[@]}" -ne 1 ]; then
+            echo "Expected exactly one built installer, found ${#built_installers[@]}." >&2
+            exit 1
+          fi
+          expected_asset=$(basename "${built_installers[0]}")
+
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TARGET_TAG" --jq '.id' 2>/dev/null || true)
+          if [ -z "$release_id" ]; then
+            echo "No prior release exists for $TARGET_TAG."
+            exit 0
+          fi
+
+          assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
+          mapfile -t extra_asset_ids < <(printf '%s' "$assets" | jq -r --arg expected "$expected_asset" '
+            .[] | select(
+              (.name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")) and
+              .name != $expected
+            ) | .id
+          ')
+          for asset_id in "${extra_asset_ids[@]}"; do
+            echo "Deleting ambiguous installer asset id $asset_id from $TARGET_TAG."
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done
+
+      - name: Create Release and Upload Asset
+        if: steps.stable-freshness.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.check.outputs.tag_name }}
@@ -246,7 +404,11 @@ jobs:
             Automated Windows installer package for Codex Load Balancer version `${{ steps.check.outputs.tag_name }}`.
 
             Double-click the installer to install. Launching the program will start Codex Load Balancer silently in the background and pop up the dashboard in your default browser.
+
+            wrapper-sha: ${{ github.sha }}
           files: dist/CodexLB_Installer_*.exe
+          fail_on_unmatched_files: true
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # Self-heal the "latest" badge on every run, regardless of whether a new
@@ -260,6 +422,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_ASSET: ${{ steps.check.outputs.newest_stable_asset }}
           NEWEST_STABLE: ${{ steps.check.outputs.newest_stable_tag }}
         run: |
           set -uo pipefail
@@ -270,9 +433,32 @@ jobs:
           # failure email). Retry with backoff, then downgrade to a warning.
 
           reconcile() {
-            # Only reconcile if we actually have a build for the newest stable tag.
-            if ! gh release view "$NEWEST_STABLE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Only point "latest" at a published release that the runtime
+            # updater itself would accept.
+            local release_json
+            release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$NEWEST_STABLE" 2>/dev/null || true)
+            if [ -z "$release_json" ]; then
               echo "No release for $NEWEST_STABLE yet; skipping latest reconciliation."
+              return 0
+            fi
+
+            local verified
+            verified=$(printf '%s' "$release_json" | jq --arg expected "$EXPECTED_ASSET" '
+              [.assets[]? | select(
+                .name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")
+              )] as $installers |
+              [$installers[] | select(
+                .name == $expected and
+                .size >= 1048576 and .size <= 536870912 and
+                ((.digest // "") | test("^sha256:[0-9a-fA-F]{64}$"))
+              )] as $accepted |
+              if (
+                .draft == false and .prerelease == false and
+                ($installers | length) == 1 and ($accepted | length) == 1
+              ) then 1 else 0 end
+            ') || return 1
+            if [ "$verified" != "1" ]; then
+              echo "Release $NEWEST_STABLE is not yet updater-verifiable; skipping latest reconciliation."
               return 0
             fi
 
@@ -306,11 +492,12 @@ jobs:
   # Edge channel: a single rolling pre-release ("edge") rebuilt whenever
   # upstream main moves, gated on upstream's unit test suite. The launcher's
   # opt-in "Edge Channel" tray toggle follows it via the upstream-sha marker
-  # in the release body. The asset name is fixed so the release replaces
-  # itself in place — no tag or asset accumulation.
+  # in the release body. The asset filename includes that full SHA so clients
+  # can reject a body/asset mismatch during rolling-release publication.
   # ---------------------------------------------------------------------------
   edge-check:
     name: Check Upstream Main for Edge Build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       build_needed: ${{ steps.check.outputs.build_needed }}
@@ -330,19 +517,45 @@ jobs:
           subject=$(gh api repos/Soju06/codex-lb/branches/main \
             --jq '.commit.commit.message' | head -n 1 | tr -d '"`$\\')
 
-          published=$(gh release view edge --repo "$GITHUB_REPOSITORY" \
-            --json body --jq '.body' 2>/dev/null \
-            | grep -oiE 'upstream-sha: *[0-9a-f]{7,40}' \
-            | grep -oiE '[0-9a-f]{7,40}' | head -n 1 || true)
+          edge_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/edge" 2>/dev/null || true)
+          published=$(printf '%s' "$edge_release" \
+            | jq -r '.body // ""' 2>/dev/null \
+            | grep -oiE 'upstream-sha: *[0-9a-f]{40}' \
+            | grep -oiE '[0-9a-f]{40}' | head -n 1 || true)
+          published_wrapper=$(printf '%s' "$edge_release" \
+            | jq -r '.body // ""' 2>/dev/null \
+            | grep -oiE 'wrapper-sha: *[0-9a-f]{40}' \
+            | grep -oiE '[0-9a-f]{40}' | head -n 1 || true)
+          expected_asset="CodexLB_Installer_edge_${published}_${published_wrapper}.exe"
+          verified_assets=$(printf '%s' "$edge_release" | jq --arg expected "$expected_asset" '
+            [.assets[]? | select(
+              .name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")
+            )] as $installers |
+            [$installers[] | select(
+              .name == $expected and
+              .size >= 1048576 and .size <= 536870912 and
+              ((.digest // "") | test("^sha256:[0-9a-fA-F]{64}$"))
+            )] as $verified |
+            if (
+              .draft == false and .prerelease == true and
+              ($installers | length) == 1 and ($verified | length) == 1
+            ) then 1 else 0 end
+          ' 2>/dev/null || echo 0)
+          verified_assets=${verified_assets:-0}
 
           echo "Upstream main:  $sha"
           echo "Published edge: ${published:-<none>}"
+          echo "Published wrapper: ${published_wrapper:-<none>}"
+          echo "Current wrapper:   $GITHUB_SHA"
+          echo "Verified edge installer assets: $verified_assets"
 
           {
             echo "sha=$sha"
             echo "sha_short=${sha:0:7}"
             echo "subject=$subject"
-            if [ "$sha" = "$published" ]; then
+            if [ "$sha" = "$published" ] && \
+               [ "$GITHUB_SHA" = "$published_wrapper" ] && \
+               [ "$verified_assets" = "1" ]; then
               echo "build_needed=false"
             else
               echo "build_needed=true"
@@ -367,11 +580,12 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          version: '0.11.29'
 
       - name: Run upstream unit tests
         run: |
           cd codex-lb-src
-          uv sync
+          uv sync --frozen
           uv run pytest tests/unit -q
 
   edge-build:
@@ -379,6 +593,9 @@ jobs:
     needs: [edge-check, edge-test]
     if: needs.edge-check.outputs.build_needed == 'true'
     runs-on: windows-latest
+    concurrency:
+      group: edge-publish-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - name: Checkout Our Repository
         uses: actions/checkout@v4
@@ -396,7 +613,10 @@ jobs:
       - name: Setup Go compiler
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
+
+      - name: Test launcher
+        run: go test ./...
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -411,16 +631,20 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Test bundle builder
+        run: python -m unittest -v test_bundle_build.py test_release_policy.py
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          version: '0.11.29'
 
       - name: Install build tools (Pillow, rsrc)
         shell: bash
         run: |
-          pip install Pillow
-          go install github.com/akavel/rsrc@latest
+          pip install Pillow==12.3.0
+          go install github.com/akavel/rsrc@v0.10.2
 
       - name: Build Frontend Assets
         shell: bash
@@ -434,16 +658,66 @@ jobs:
       - name: Build and Package Installer
         shell: pwsh
         env:
+          CODEXLB_UPDATE_CHANNEL: edge
           CODEXLB_UPSTREAM_SHA: ${{ needs.edge-check.outputs.sha }}
+          CODEXLB_WRAPPER_SHA: ${{ github.sha }}
         run: |
           python bundle_build.py
 
-      - name: Rename installer to fixed edge asset name
+      - name: Bind edge installer name to upstream commit
         shell: bash
         run: |
-          mv dist/CodexLB_Installer_*.exe dist/CodexLB_Installer_edge.exe
+          mv dist/CodexLB_Installer_*.exe \
+            dist/CodexLB_Installer_edge_${{ needs.edge-check.outputs.sha }}_${{ github.sha }}.exe
+
+      - name: Verify edge target is still current
+        id: edge-freshness
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ needs.edge-check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          latest_sha=$(gh api repos/Soju06/codex-lb/branches/main --jq '.commit.sha')
+          latest_wrapper_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')
+          if [ "$latest_sha" != "$TARGET_SHA" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping stale edge build $TARGET_SHA; upstream main is now $latest_sha."
+          elif [ "$latest_wrapper_sha" != "$GITHUB_SHA" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping stale wrapper build $GITHUB_SHA; wrapper main is now $latest_wrapper_sha."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove superseded edge installer assets
+        if: steps.edge-freshness.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_ASSET: CodexLB_Installer_edge_${{ needs.edge-check.outputs.sha }}_${{ github.sha }}.exe
+        run: |
+          set -euo pipefail
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/edge" --jq '.id' 2>/dev/null || true)
+          if [ -z "$release_id" ]; then
+            echo "No prior edge release exists."
+            exit 0
+          fi
+
+          assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
+          mapfile -t asset_ids < <(printf '%s' "$assets" | jq -r --arg expected "$EXPECTED_ASSET" '
+            .[] | select(
+              (.name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")) and
+              .name != $expected
+            ) | .id
+          ')
+          for asset_id in "${asset_ids[@]}"; do
+            echo "Deleting superseded edge asset id $asset_id."
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done
 
       - name: Publish rolling edge release
+        if: steps.edge-freshness.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: edge
@@ -461,5 +735,8 @@ jobs:
             - Build run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
             upstream-sha: ${{ needs.edge-check.outputs.sha }}
-          files: dist/CodexLB_Installer_edge.exe
+            wrapper-sha: ${{ github.sha }}
+          files: dist/CodexLB_Installer_edge_${{ needs.edge-check.outputs.sha }}_${{ github.sha }}.exe
+          fail_on_unmatched_files: true
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}

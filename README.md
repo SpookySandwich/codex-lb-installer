@@ -21,10 +21,10 @@ It packages the backend, frontend dashboard, and a portable Python runtime into 
 *   🖥️ **System Tray Icon**: Runs in the system tray with Open Dashboard, Auto Update, and Quit options.
 *   🌐 **Auto-Launch Dashboard**: Automatically pops up the dashboard (`http://localhost:2455`) in your default web browser on startup.
 *   🔒 **Single-Instance Mutex**: Restricts execution to a single background process. Launching the shortcut again simply opens the browser redirect and exits.
-*   🔄 **Auto Update**: Checks for new stable releases from GitHub and installs them silently. Only stable releases are installed — pre-releases are skipped.
+*   🔄 **Verified Updates**: Follows stable releases by default, with an opt-in rolling edge channel. Every installer is size-bounded and SHA-256 verified against GitHub's release metadata before it can run.
 *   🧹 **Clean Uninstallation**: Fully registers with Windows Add/Remove programs with a checkbox option to purge database settings (`~/.codex-lb`).
 *   🌏 **Multi-Language**: Tray menu auto-detects Windows system language and uses Chinese (Simplified) when applicable.
-*   🤖 **Automated CI Releases**: A scheduled GitHub Actions workflow checks the target repository for new releases daily, compiles the installer, and publishes the release binaries here automatically.
+*   🤖 **Automated CI Releases**: A scheduled GitHub Actions workflow checks the target repository every six hours, tests the launcher, compiles the installer, and publishes release binaries here automatically.
 
 ---
 
@@ -40,10 +40,11 @@ It packages the backend, frontend dashboard, and a portable Python runtime into 
 
 CodexLB includes a built-in auto-update mechanism via the system tray:
 
-- **Manual**: Right-click the tray icon → **Check for Updates** to check and install the latest stable release.
-- **Automatic**: Enable **Auto Update** in the tray menu to check for updates on every startup. If a newer stable release is found, it downloads and installs silently in the background.
+- **Manual**: Right-click the tray icon → **Check for Updates** to check the active channel and choose whether to install.
+- **Automatic**: Enable **Auto Update** to check on startup and install a newer build silently.
+- **Channels**: Stable is the default and skips prereleases. **Edge Channel** follows the tested rolling build of upstream `main`; switching back explicitly returns to the newest stable build.
 
-Only **stable releases** are installed — pre-release and beta versions are automatically skipped.
+Update work is single-flight, so automatic and repeated manual checks cannot start competing installers. The updater accepts only the canonical release asset over HTTPS, enforces the published byte size, verifies GitHub's SHA-256 digest while streaming to a temporary `.part` file, and promotes it only after validation. Python/application payloads are content-addressed and installed side by side, with the previous payload retained instead of overlaying a live environment. CodexLB continues serving while the download and installer wizard run; Setup stops it only when installation is ready to commit, and a failed commit attempts to restore the prior launcher and payload.
 
 ---
 
@@ -66,9 +67,10 @@ If you want to compile the installer package locally:
    npm install && npm run build
    cd ../..
    ```
-4. Run the builder script (requires Go, Python with `uv` on PATH, and Pillow):
+4. Run the builder script (requires Go, Inno Setup 6, Python with `uv` on PATH, and Pillow):
    ```bash
-   pip install Pillow
+   pip install Pillow==12.3.0
+   go install github.com/akavel/rsrc@v0.10.2
    python bundle_build.py
    ```
 5. Grab your compiled installer in the `dist/` directory!
