@@ -38,7 +38,8 @@ APP_VERSION_PATTERN = re.compile(
 )
 BUILD_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 PAYLOAD_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
-VALID_UPDATE_CHANNELS = frozenset({"stable", "beta", "edge"})
+EDGE_UPDATE_CHANNEL = "edge"
+VALID_UPDATE_CHANNELS = frozenset({"stable", "beta", EDGE_UPDATE_CHANNEL})
 # "release" is the user-facing name for the stable channel; the launcher stores
 # and compares the historical "stable" value, so normalize the alias here.
 UPDATE_CHANNEL_ALIASES = {"release": "stable"}
@@ -437,6 +438,26 @@ def get_wrapper_sha() -> str:
     return validate_build_sha(result.stdout)
 
 
+def channel_qualified_version(version: str, channel: str, build_sha: str) -> str:
+    """Mark edge builds with the upstream commit they were cut from.
+
+    Upstream's pyproject carries the *next* tag's number while main is still
+    moving, so a main build and the release tag that eventually ships it both
+    call themselves e.g. 1.23.0-beta.2 while containing different trees. Semver
+    build metadata distinguishes them without affecting precedence: the spec
+    says build metadata is ignored when comparing, which is what keeps the
+    updater's ordering unchanged.
+    """
+    validated = validate_app_version(version)
+    if validate_update_channel(channel) != EDGE_UPDATE_CHANNEL:
+        return validated
+    if "+" in validated:
+        # Already carries build metadata; do not stack another suffix.
+        return validated
+    short_sha = validate_build_sha(build_sha)[:7]
+    return validate_app_version(f"{validated}+edge.{short_sha}")
+
+
 def get_app_version() -> str:
     """Read and validate the version from codex-lb-src/pyproject.toml."""
     pyproject = SRC_DIR / "pyproject.toml"
@@ -456,10 +477,10 @@ def get_app_version() -> str:
 def copy_launcher(payload_id: str) -> None:
     print("Compiling and copying launcher.exe...")
     embed_icon_resource()
-    app_version = get_app_version()
     build_sha = get_build_sha()
     wrapper_sha = get_wrapper_sha()
     update_channel = get_update_channel()
+    app_version = channel_qualified_version(get_app_version(), update_channel, build_sha)
     payload_id = validate_payload_id(payload_id)
     ldflags = (
         f"-H=windowsgui -X main.currentVersion={app_version} "
@@ -494,7 +515,9 @@ def compile_installer(payload_id: str) -> Path:
     if not ISCC_PATH.is_file():
         raise FileNotFoundError(f"Inno Setup compiler not found at {ISCC_PATH}")
 
-    app_version = get_app_version()
+    app_version = channel_qualified_version(
+        get_app_version(), get_update_channel(), get_build_sha()
+    )
     payload_id = validate_payload_id(payload_id)
     actual_payload_id = compute_payload_id()
     if actual_payload_id != payload_id:

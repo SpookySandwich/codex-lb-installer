@@ -421,6 +421,36 @@ func TestUpdateCoordinatorReportsPhasesToObserver(t *testing.T) {
 	}
 }
 
+func TestEdgeBuildMetadataIsNotDuplicatedInDisplay(t *testing.T) {
+	savedVersion, savedSHA, savedChannel := currentVersion, buildSHA, buildChannel
+	t.Cleanup(func() { currentVersion, buildSHA, buildChannel = savedVersion, savedSHA, savedChannel })
+
+	buildSHA = testFullSHA
+	buildChannel = string(edgeChannel)
+
+	// A build stamped by bundle_build.py already names its commit.
+	currentVersion = "1.23.0-beta.2+edge.0123456"
+	if got := currentDisplay(edgeChannel); got != "v1.23.0-beta.2+edge.0123456" {
+		t.Fatalf("currentDisplay() = %q, want the stamped version without a repeated sha", got)
+	}
+
+	// Builds predating the stamp still get the sha appended, so they remain
+	// distinguishable from the tag that shares their number.
+	currentVersion = "1.23.0-beta.2"
+	want := "v1.23.0-beta.2 (" + shortSHA(testFullSHA) + ")"
+	if got := currentDisplay(edgeChannel); got != want {
+		t.Fatalf("currentDisplay() = %q, want %q", got, want)
+	}
+
+	// Build metadata must never affect precedence.
+	if compareVersions("1.23.0-beta.2+edge.0123456", "1.23.0-beta.2") != 0 {
+		t.Fatal("edge build metadata changed version precedence")
+	}
+	if isNewerVersion("1.23.0-beta.2+edge.0123456", "1.23.0-beta.2") {
+		t.Fatal("a stamped edge build must not be treated as newer than the same version")
+	}
+}
+
 func TestInstallConfirmMessageWarnsAboutDowntime(t *testing.T) {
 	msg := installConfirmMessage("v2.0.0", stableChannel)
 	if !strings.Contains(msg, lang.DowntimeNotice) {

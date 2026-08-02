@@ -47,6 +47,37 @@ class BuildHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bundle_build.validate_update_channel("nightly")
 
+    def test_channel_qualified_version_marks_only_edge_builds(self) -> None:
+        sha = "c539a200c301e5cdf2cf524dea336e1c40094bbd"
+        # Edge builds are stamped with the upstream commit they came from,
+        # because main and the tag it precedes share a version number.
+        self.assertEqual(
+            bundle_build.channel_qualified_version("1.23.0-beta.2", "edge", sha),
+            "1.23.0-beta.2+edge.c539a20",
+        )
+        # Tagged channels are the tag, so their number is already honest.
+        for channel in ("stable", "release", "beta"):
+            with self.subTest(channel=channel):
+                self.assertEqual(
+                    bundle_build.channel_qualified_version("1.23.0-beta.2", channel, sha),
+                    "1.23.0-beta.2",
+                )
+        # Never stack a second suffix onto a version that already has one.
+        self.assertEqual(
+            bundle_build.channel_qualified_version("1.23.0-beta.2+edge.abcdef0", "edge", sha),
+            "1.23.0-beta.2+edge.abcdef0",
+        )
+        # The result must remain a version the builder accepts everywhere.
+        stamped = bundle_build.channel_qualified_version("1.23.0", "edge", sha)
+        self.assertEqual(bundle_build.validate_app_version(stamped), stamped)
+        self.assertEqual(
+            bundle_build.installer_output_basename(stamped),
+            "CodexLB_Installer_1.23.0_edge.c539a20",
+        )
+        # A malformed upstream sha must not silently produce a bogus version.
+        with self.assertRaises(ValueError):
+            bundle_build.channel_qualified_version("1.23.0", "edge", "not-a-sha")
+
     def test_installer_output_basename_is_safe(self) -> None:
         self.assertEqual(
             bundle_build.installer_output_basename("1.20.2-beta.1+build.7"),

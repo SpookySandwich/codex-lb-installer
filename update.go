@@ -1102,7 +1102,12 @@ func cleanupStaleUpdateArtifacts(directory string, now time.Time, maxAge time.Du
 func currentDisplay(channel updateChannel) string {
 	display := displayVersion(currentVersion)
 	if channel == edgeChannel && installedUpdateChannel() == edgeChannel && buildSHA != "" {
-		return fmt.Sprintf("%s (%s)", display, shortSHA(buildSHA))
+		// Edge builds carry their upstream commit as semver build metadata
+		// (e.g. 1.23.0-beta.2+edge.c539a20). Appending the sha again would
+		// print it twice, so only add it for builds that predate that.
+		if !strings.Contains(display, "+edge.") {
+			return fmt.Sprintf("%s (%s)", display, shortSHA(buildSHA))
+		}
 	}
 	return display
 }
