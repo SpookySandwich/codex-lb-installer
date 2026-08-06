@@ -374,9 +374,13 @@ jobs:
           fi
           expected_asset=$(basename "${built_installers[0]}")
 
+          # gh prints the API error body to STDOUT on a 404, so a tag we have
+          # not published yet yields a JSON blob rather than an empty string.
+          # Testing for emptiness alone let that blob through and it was then
+          # interpolated into the assets URL. Only a numeric id is a release.
           release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TARGET_TAG" --jq '.id' 2>/dev/null || true)
-          if [ -z "$release_id" ]; then
-            echo "No prior release exists for $TARGET_TAG."
+          if ! printf '%s' "$release_id" | grep -Eq '^[0-9]+$'; then
+            echo "No prior release exists for $TARGET_TAG; nothing to clean up."
             exit 0
           fi
 
@@ -701,9 +705,11 @@ jobs:
           EXPECTED_ASSET: CodexLB_Installer_edge_${{ needs.edge-check.outputs.sha }}_${{ github.sha }}.exe
         run: |
           set -euo pipefail
+          # Same 404-body-on-stdout hazard as the stable job: only a numeric id
+          # identifies a real release.
           release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/edge" --jq '.id' 2>/dev/null || true)
-          if [ -z "$release_id" ]; then
-            echo "No prior edge release exists."
+          if ! printf '%s' "$release_id" | grep -Eq '^[0-9]+$'; then
+            echo "No prior edge release exists; nothing to clean up."
             exit 0
           fi
 
