@@ -374,29 +374,27 @@ jobs:
           fi
           expected_asset=$(basename "${built_installers[0]}")
 
-          # gh prints the API error body to STDOUT on a 404, so a tag we have
-          # not published yet yields a JSON blob rather than an empty string.
-          # Testing for emptiness alone let that blob through and it was then
-          # interpolated into the assets URL. Only a numeric id is a release.
-          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TARGET_TAG" --jq '.id' 2>/dev/null || true)
-          if ! printf '%s' "$release_id" | grep -Eq '^[0-9]+$'; then
+          # Work in asset NAMES, never ids: nothing parsed out of API output is
+          # ever pasted back into a URL, which is where both past failures came
+          # from. `gh release view` exits non-zero when the release does not
+          # exist yet, which is the normal case for a tag we have never built.
+          if ! names=$(gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' 2>/dev/null); then
             echo "No prior release exists for $TARGET_TAG; nothing to clean up."
             exit 0
           fi
 
-          assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
-          # jq on the Windows runner terminates lines with CRLF and mapfile -t
-          # strips only the newline, so the trailing CR would ride along into
-          # the delete URL and gh would reject it as a control character.
-          mapfile -t extra_asset_ids < <(printf '%s' "$assets" | jq -r --arg expected "$expected_asset" '
-            .[] | select(
-              (.name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")) and
-              .name != $expected
-            ) | .id
-          ' | tr -d '\r')
-          for asset_id in "${extra_asset_ids[@]}"; do
-            echo "Deleting ambiguous installer asset id $asset_id from $TARGET_TAG."
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          # tr -d '\r' because tooling on the Windows runner emits CRLF.
+          printf '%s\n' "$names" | tr -d '\r' | while read -r name; do
+            case "$name" in
+              CodexLB_Installer_*.exe)
+                if [ "$name" != "$expected_asset" ]; then
+                  echo "Deleting superseded installer asset $name from $TARGET_TAG."
+                  gh release delete-asset "$TARGET_TAG" "$name" \
+                    --repo "$GITHUB_REPOSITORY" --yes
+                fi
+                ;;
+            esac
           done
 
       - name: Create Release and Upload Asset
@@ -442,9 +440,11 @@ jobs:
           reconcile() {
             # Only point "latest" at a published release that the runtime
             # updater itself would accept.
+            # Same existence idiom as the cleanup steps: a non-zero exit means
+            # the release is absent. Testing the output for emptiness does not
+            # work, because gh writes API error bodies to stdout.
             local release_json
-            release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$NEWEST_STABLE" 2>/dev/null || true)
-            if [ -z "$release_json" ]; then
+            if ! release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$NEWEST_STABLE" 2>/dev/null); then
               echo "No release for $NEWEST_STABLE yet; skipping latest reconciliation."
               return 0
             fi
@@ -705,27 +705,23 @@ jobs:
           EXPECTED_ASSET: CodexLB_Installer_edge_${{ needs.edge-check.outputs.sha }}_${{ github.sha }}.exe
         run: |
           set -euo pipefail
-          # Same 404-body-on-stdout hazard as the stable job: only a numeric id
-          # identifies a real release.
-          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/edge" --jq '.id' 2>/dev/null || true)
-          if ! printf '%s' "$release_id" | grep -Eq '^[0-9]+$'; then
+          # Same shape as the stable cleanup: names only, no ids, no URLs.
+          if ! names=$(gh release view edge --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' 2>/dev/null); then
             echo "No prior edge release exists; nothing to clean up."
             exit 0
           fi
 
-          assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
-          # jq on the Windows runner terminates lines with CRLF and mapfile -t
-          # strips only the newline, so the trailing CR would ride along into
-          # the delete URL and gh would reject it as a control character.
-          mapfile -t asset_ids < <(printf '%s' "$assets" | jq -r --arg expected "$EXPECTED_ASSET" '
-            .[] | select(
-              (.name | test("^CodexLB_Installer_[0-9A-Za-z][0-9A-Za-z._-]*\\.exe$"; "i")) and
-              .name != $expected
-            ) | .id
-          ' | tr -d '\r')
-          for asset_id in "${asset_ids[@]}"; do
-            echo "Deleting superseded edge asset id $asset_id."
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          printf '%s\n' "$names" | tr -d '\r' | while read -r name; do
+            case "$name" in
+              CodexLB_Installer_*.exe)
+                if [ "$name" != "$EXPECTED_ASSET" ]; then
+                  echo "Deleting superseded edge asset $name."
+                  gh release delete-asset edge "$name" \
+                    --repo "$GITHUB_REPOSITORY" --yes
+                fi
+                ;;
+            esac
           done
 
       - name: Publish rolling edge release
