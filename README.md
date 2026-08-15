@@ -1,5 +1,3 @@
-# CodexLB
-
 **English** | [中文](README.zh-CN.md)
 
 [![Release](https://img.shields.io/github/v/release/SpookySandwich/codex-lb-installer?include_prereleases)](https://github.com/SpookySandwich/codex-lb-installer/releases)
@@ -9,7 +7,6 @@ Windows installer for [Codex LB](https://github.com/Soju06/codex-lb).
 
 <p align="center">
   <img src="install.png" width="46%" alt="CodexLB installer">
-  <img src="tray.png" width="46%" alt="CodexLB tray menu">
 </p>
 
 ## Install
