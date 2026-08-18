@@ -224,6 +224,14 @@ jobs:
         if: steps.check.outputs.build_needed == 'true'
         run: go test ./...
 
+      # Deliberately not gated on build_needed: this guards the prune script
+      # itself, so it has to run on the pushes that change it, not only on the
+      # runs that happen to have a new upstream release to build. It is
+      # hermetic (stubs gh and sleep) and takes well under a second.
+      - name: Test release-asset prune
+        shell: bash
+        run: bash .github/scripts/test-prune-installer-assets.sh
+
       - name: Setup Node.js
         if: steps.check.outputs.build_needed == 'true'
         uses: actions/setup-node@v4
@@ -372,30 +380,8 @@ jobs:
             echo "Expected exactly one built installer, found ${#built_installers[@]}." >&2
             exit 1
           fi
-          expected_asset=$(basename "${built_installers[0]}")
-
-          # Work in asset NAMES, never ids: nothing parsed out of API output is
-          # ever pasted back into a URL, which is where both past failures came
-          # from. `gh release view` exits non-zero when the release does not
-          # exist yet, which is the normal case for a tag we have never built.
-          if ! names=$(gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" \
-                 --json assets --jq '.assets[].name' 2>/dev/null); then
-            echo "No prior release exists for $TARGET_TAG; nothing to clean up."
-            exit 0
-          fi
-
-          # tr -d '\r' because tooling on the Windows runner emits CRLF.
-          printf '%s\n' "$names" | tr -d '\r' | while read -r name; do
-            case "$name" in
-              CodexLB_Installer_*.exe)
-                if [ "$name" != "$expected_asset" ]; then
-                  echo "Deleting superseded installer asset $name from $TARGET_TAG."
-                  gh release delete-asset "$TARGET_TAG" "$name" \
-                    --repo "$GITHUB_REPOSITORY" --yes
-                fi
-                ;;
-            esac
-          done
+          bash .github/scripts/prune-installer-assets.sh \
+            "$TARGET_TAG" "$(basename "${built_installers[0]}")"
 
       - name: Create Release and Upload Asset
         if: steps.stable-freshness.outputs.publish == 'true'
@@ -705,24 +691,7 @@ jobs:
           EXPECTED_ASSET: CodexLB_Installer_edge_${{ needs.edge-check.outputs.sha }}_${{ github.sha }}.exe
         run: |
           set -euo pipefail
-          # Same shape as the stable cleanup: names only, no ids, no URLs.
-          if ! names=$(gh release view edge --repo "$GITHUB_REPOSITORY" \
-                 --json assets --jq '.assets[].name' 2>/dev/null); then
-            echo "No prior edge release exists; nothing to clean up."
-            exit 0
-          fi
-
-          printf '%s\n' "$names" | tr -d '\r' | while read -r name; do
-            case "$name" in
-              CodexLB_Installer_*.exe)
-                if [ "$name" != "$EXPECTED_ASSET" ]; then
-                  echo "Deleting superseded edge asset $name."
-                  gh release delete-asset edge "$name" \
-                    --repo "$GITHUB_REPOSITORY" --yes
-                fi
-                ;;
-            esac
-          done
+          bash .github/scripts/prune-installer-assets.sh edge "$EXPECTED_ASSET"
 
       - name: Publish rolling edge release
         if: steps.edge-freshness.outputs.publish == 'true'

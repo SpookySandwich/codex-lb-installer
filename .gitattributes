@@ -1,0 +1,9 @@
+# Pin shell helpers to LF on every platform. The build jobs run on
+# windows-latest with core.autocrlf=true, so without this a checkout there
+# could hand bash a script whose lines end in CR. Git Bash tolerates a stray CR
+# in some positions and not others, which is the worst kind of dependency to
+# leave to chance -- so pin it rather than rely on that behaviour.
+#
+# Deliberately scoped to *.sh: a repo-wide `text=auto` would renormalize every
+# tracked file on the next checkout.
+*.sh text eol=lf
